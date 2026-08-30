@@ -120,4 +120,4 @@ Weiter mit Skill `video-cut-entscheidung`.
   Git Bash normal
 - Port prüfen/freimachen: statt `lsof -ti :8766` →
   `netstat -ano | findstr :8766`, dann `taskkill //PID <pid> //F`
-- ffmpeg installieren: `winget install ffmpeg` · Python 3.12: `winget install Python.Python.3.12`
+- ffmpeg installieren: `winget install -e --id Gyan.FFmpeg` · Python 3.12: `winget install Python.Python.3.12`

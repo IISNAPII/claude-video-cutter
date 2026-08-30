@@ -17,6 +17,10 @@ import sys, os, json, subprocess, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 BATCH = 25
 FADE_S = 0.012
+# Bildrate der Timeline. Das Quellmaterial ist 30 fps und der B-Roll-Sync-Pass
+# rendert fest mit fps=30 — die Clipdauern werden darauf gerastet, damit Bild
+# und Ton nicht auseinanderlaufen (siehe apply_jcut_edges).
+FPS = 30.0
 
 def run(cmd, **kw):
     r = subprocess.run(cmd, capture_output=True, text=True, **kw)
@@ -51,8 +55,23 @@ def main():
                 continue
             segs.append({"in": round(float(tc["in"]), 4), "out": round(float(tc["out"]), 4),
                          "first_id": tc.get("id", f"tl{len(segs)}"),
-                         "gain_db": float(tc.get("gain", 0) or 0), "flags": ["timeline"]})
-        print(f"[rerender] TIMELINE-Modus: {len(segs)} Clips direkt aus dem Cockpit", flush=True)
+                         "gain_db": float(tc.get("gain", 0) or 0),
+                         "jcut": max(0.0, float(tc.get("jcut", 0) or 0)),
+                         "flags": ["timeline"]})
+        if segs:
+            segs[0]["jcut"] = 0.0          # der erste Clip hat keine linke Naht
+        apply_jcut_edges(segs)
+        n_j = sum(1 for s in segs if s["jcut"] > 1e-3)
+        # Fingerprint des Cockpit-Stands: beweist, WELCHER Stand gerendert
+        # wird (Speicherzeit + Pruefsumme + Umfang). Gehoert in jede Uebergabe.
+        import hashlib, time as _time
+        _fp = hashlib.md5(open(ovr_path, "rb").read()).hexdigest()[:10]
+        _mt = _time.strftime("%d.%m.%Y %H:%M:%S", _time.localtime(os.path.getmtime(ovr_path)))
+        _soll = sum(s["v_out"] - s["v_in"] for s in segs)
+        print(f"[rerender] Cockpit-Stand: gespeichert {_mt} (md5 {_fp}) — "
+              f"{len(segs)} Clips, {len(broll)} B-Roll-Slots, Soll-Laenge {_soll:.3f}s", flush=True)
+        print(f"[rerender] TIMELINE-Modus: {len(segs)} Clips direkt aus dem Cockpit"
+              + (f", {n_j}× L-Cut" if n_j else ""), flush=True)
         json.dump({"segments": segs, "keep_s": round(sum(s['out']-s['in'] for s in segs), 1)},
                   open(os.path.join(workdir, "segments_effective.json"), "w"),
                   ensure_ascii=False, indent=1)
@@ -147,48 +166,360 @@ def main():
     render_segments(segs, src, out_mp4, mode, broll, workdir)
 
 
+def apply_jcut_edges(segs):
+    """Leitet Ton-Positionen und Bildkanten aus jcut ab (J-Cut / Split-Edit).
+
+    jcut(i) = Sekunden, um die der TON von Segment i FRUEHER beginnt als sein
+    Bild. Man hoert den naechsten Clip schon, waehrend man noch den vorherigen
+    sieht.
+
+        a_start(i) = a_end(i-1) - jcut(i)     Ton, Laenge bleibt dur(i)
+        v_start(i) = a_end(i-1)               Bild, lueckenlos am Vorgaenger
+        v_in(i)    = in(i) + jcut(i)          Bild verliert seinen ANFANG
+        v_out(i)   = out(i)
+
+    Bild und Ton bleiben dadurch im ganzen Segment synchron. Es wird KEIN
+    geschnittenes Material zurueckgeholt und nichts verlaengert — das Bild wird
+    nur vorne kuerzer.
+
+    Folge: die Toene benachbarter Segmente ueberlappen sich um jcut(i), und die
+    Gesamtlaenge sinkt um Σ jcut. Deshalb kann die Tonkette NICHT mehr per
+    concat gebaut werden (siehe render_base_split).
+
+    Clampt defensiv (das Cockpit clampt schon, der Render verlaesst sich nicht
+    darauf).
+    """
+    MIN_VDUR = 0.05
+    n = len(segs)
+    for i, s in enumerate(segs):
+        s["_dur"] = s["out"] - s["in"]
+    for i, s in enumerate(segs):
+        j = 0.0 if i == 0 else max(0.0, float(s.get("jcut", 0) or 0))
+        if i > 0:
+            j = min(j, max(0.0, s["_dur"] - MIN_VDUR))                       # eigenes Bild
+            j = min(j, max(0.0, segs[i-1]["_dur"] - float(segs[i-1].get("jcut", 0) or 0) - 0.02))
+            nxt = float(segs[i+1].get("jcut", 0) or 0) if i + 1 < n else 0.0
+            j = min(j, max(0.0, s["_dur"] - nxt - 0.02))                     # Nicht-Nachbarn
+        s["jcut"] = round(j, 4)
+    # FRAME-QUANTISIERUNG (01.08.2026) — sonst driftet das Bild gegen den Ton.
+    #
+    # ffmpeg schneidet Video zwangslaeufig auf Frame-Grenzen, Audio aber
+    # sample-genau. Bei 213 Clips summieren sich diese Rundungen: gemessen
+    # 304 ms Vorlauf des Bildes am Videoende — deutlich sichtbarer
+    # Lippen-Versatz, und er wird gegen Ende immer groesser.
+    #
+    # Fix: die BILDdauer jedes Clips auf ein exaktes Frame-Vielfaches legen und
+    # die gesamte Zeitachse (auch die Tonpositionen) daraus ableiten. Dann
+    # rundet ffmpeg nichts mehr nach, und Σ Bilddauern == Tonende exakt.
+    # Die Tondauer verschiebt sich dadurch um maximal eine halbe Frame-Laenge
+    # pro Clip (< 17 ms) — unhoerbar, aber es haelt Bild und Ton zusammen.
+    v_start = 0.0
+    for i, s in enumerate(segs):
+        j = float(s["jcut"])
+        vdur = s["_dur"] - j                                  # Bilddauer, exakt
+        vdur_q = max(1, round(vdur * FPS)) / FPS               # auf Frames rasten
+        # 6 Nachkommastellen: eine Framelaenge ist 0.0333... s und laesst sich
+        # auf 4 Stellen nicht sauber darstellen — der Restfehler summierte sich
+        # sonst wieder ueber 213 Clips.
+        s["v_start"] = round(v_start, 6)
+        s["v_in"] = round(s["in"] + j, 6)
+        s["v_out"] = round(s["in"] + j + vdur_q, 6)            # Frame-Vielfaches
+        s["a_start"] = round(v_start - j, 6)
+        # ROLL-SEMANTIK (30.08.): Der Ton von Segment i endet EXAKT dort, wo
+        # der Ton von Segment i+1 beginnt (a_start(i+1) = v_start(i)+vdur_q −
+        # jcut(i+1)) — KEINE Ueberlappung mehr. Vorher liefen im J-Cut-Fenster
+        # BEIDE Toene gleichzeitig (voll laut); bei Split-Naehten war das
+        # derselbe Take doppelt = hoerbares Echo (Sebastians "hoert sich an
+        # als wuerde etwas doppelt abgespielt"). Jetzt: harter Ton-Schnitt am
+        # Fensteranfang, Bild rollt wie gehabt spaeter — identisch zum
+        # Cockpit-Player (Roll-Transplantat 30.08.). Die Kette ist damit
+        # lueckenlos ueberlappungsfrei; Telescoping haelt Σ Ton == Σ Bild.
+        j_next = float(segs[i + 1].get("jcut", 0) or 0) if i + 1 < n else 0.0
+        s["a_dur"] = round(vdur_q + j - j_next, 6)             # Ton endet am naechsten Fensteranfang
+        v_start += vdur_q
+    for s in segs:
+        s.pop("_dur", None)
+    return segs
+
+
+def probe_durations(path):
+    """(video_dauer, audio_dauer) in Sekunden — fuer den A/V-Assert."""
+    out = {}
+    for st in ("v", "a"):
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", st,
+                            "-show_entries", "stream=duration", "-of",
+                            "default=noprint_wrappers=1:nokey=1", path],
+                           capture_output=True, text=True)
+        try:
+            out[st] = float((r.stdout or "").strip().splitlines()[0])
+        except Exception:
+            out[st] = None
+    return out.get("v"), out.get("a")
+
+
+def assert_av_sync(path, tol_ms=100.0):
+    """Nach einem Split-Edit-Render ist die A/V-Kopplung nicht mehr strukturell
+    durch concat=v=1:a=1 garantiert — also wird sie hier gemessen."""
+    v, a = probe_durations(path)
+    if v is None or a is None:
+        print(f"[rerender] A/V-Check: Dauer nicht lesbar (v={v}, a={a})", flush=True)
+        return
+    d = abs(v - a) * 1000.0
+    print(f"[rerender] A/V-Check: Video {v:.3f}s, Audio {a:.3f}s, Differenz {d:.1f} ms", flush=True)
+    if d > tol_ms:
+        raise SystemExit(f"A/V-Drift {d:.1f} ms > {tol_ms:.0f} ms — Render verworfen")
+
+
+def render_base_split(segs, src, mode, vf_extra, venc, tmp):
+    """Render mit J-Cut: Bild- und Tonkette getrennt bauen, am Ende muxen.
+
+    Bild: [v_in,v_out] je Segment, lueckenlos, in Batches, concat=v=1:a=0.
+    Ton:  die Stuecke UEBERLAPPEN sich um jcut — concat kann das nicht.
+          Weil sich immer nur DIREKTE Nachbarn ueberlappen (dafuer sorgt das
+          Clamping), genuegen zwei alternierende Ketten: gerade Segmente in
+          Kette A, ungerade in Kette B, dazwischen Stille aus anullsrc. Beide
+          Ketten sind in sich ueberlappungsfrei und damit concat-faehig; am
+          Ende mischt ein einziges amix=inputs=2 die beiden zusammen.
+          Das ist deutlich sparsamer als amix ueber alle 224 Stuecke.
+
+    Der Crossfade in der Ueberlappung entsteht aus den afade-Rampen: das
+    auslaufende Stueck blendet ueber jcut aus, das einsetzende ueber jcut ein.
+    """
+    abr = "320k" if mode == "max" else "192k"
+    vsegs = [s for s in segs if s["v_out"] > s["v_in"]]
+    asegs = [s for s in segs if s["out"] > s["in"]]
+    n_j = sum(1 for s in segs if float(s.get("jcut", 0) or 0) > 1e-3)
+    sum_j = sum(float(s.get("jcut", 0) or 0) for s in segs)
+    total_v = sum(s["v_out"] - s["v_in"] for s in vsegs)
+    total_a = max(s["a_start"] + float(s.get("a_dur", s["out"] - s["in"])) for s in asegs)
+    print(f"[rerender] J-CUT: {len(vsegs)} Bildclips / {len(asegs)} Tonclips, "
+          f"{n_j}× J-Cut ({sum_j:.1f}s Vorlauf gesamt), mode={mode}", flush=True)
+    print(f"[rerender]   Soll-Laenge Bild {total_v:.3f}s / Ton {total_a:.3f}s "
+          f"(Differenz {abs(total_v-total_a)*1000:.1f} ms)", flush=True)
+    if abs(total_v - total_a) > 0.05:
+        raise SystemExit(f"J-Cut-Mathematik verletzt: Bild {total_v:.3f}s != Ton {total_a:.3f}s")
+
+    # ---- Bildkette (Batches, ohne Audio) ----
+    vparts = []
+    for bi in range(0, len(vsegs), BATCH):
+        chunk = vsegs[bi:bi + BATCH]; parts = ""; ci = ""
+        for k, s in enumerate(chunk):
+            # fps={FPS} ZWINGEND: Kameraquellen laufen selten exakt mit der
+            # deklarierten Rate (yt1b: 29.9885 statt 30). Ohne diesen Filter
+            # erbt der Schnitt die krumme Rate, waehrend der Ton in exakten
+            # Sekunden geschnitten wird — das Bild eilt dann linear vor
+            # (gemessen: 617 ms nach 26 Minuten, am Ende deutlich sichtbar).
+            # Der Filter dupliziert/verwirft dafuer etwa alle 2600 Frames
+            # einen einzigen — unsichtbar.
+            # Exakte Frame-Zahl erzwingen. fps= allein reicht NICHT: bei einer
+            # krummen Quellrate (29.9885) liefert der Filter mal einen Frame
+            # zu wenig — ueber 213 Clips fehlten so 10 Frames = 333 ms Drift.
+            # Deshalb: etwas Reserve schneiden, auf 30 fps rastern, dann per
+            # select exakt die ersten N Frames behalten.
+            nfr = max(1, round((s['v_out'] - s['v_in']) * FPS))
+            # tpad klont den letzten Frame, falls die Reserve nicht reicht
+            # (z.B. am Dateiende) — sonst liefert select weniger als nfr und
+            # der Clip ist einen Frame zu kurz. select begrenzt danach exakt.
+            parts += (f"[0:v]trim={s['v_in']:.4f}:{s['v_out'] + 0.2:.4f},"
+                      f"setpts=PTS-STARTPTS,fps={FPS:g},"
+                      f"tpad=stop_mode=clone:stop_duration=0.5,"
+                      + "select='lt(n\\," + str(nfr) + ")',setpts=N/" + f"{FPS:g}" + "/TB"
+                      f"{vf_extra}[v{k}];")
+            ci += f"[v{k}]"
+        # setpts NACH dem concat: concat setzt die PTS des Folgeclips ans Ende
+        # des vorherigen — durch Zeitbasis-Rundung landen dabei einzelne Frames
+        # minimal neben dem 30fps-Raster. Ein Encoder mit -vsync cfr rastert neu
+        # und verwirft dann den Frame, der auf einem schon belegten Platz landet
+        # (gemessen: Filterkette liefert 5272, Datei hatte 5271). Dieses setpts
+        # legt die PTS auf ein exaktes Raster, -fps_mode passthrough laesst sie
+        # danach unangetastet — der Encoder darf nicht mehr selbst rastern.
+        fc = parts + f"{ci}concat=n={len(chunk)}:v=1:a=0,setpts=N/{FPS:g}/TB[v]"
+        bf = os.path.join(tmp, f"v{bi//BATCH:03d}.mp4")
+        run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-filter_complex", fc,
+             "-map", "[v]", "-an", *venc,
+             "-fps_mode", "passthrough", "-video_track_timescale", str(int(FPS * 1000)),
+             bf])   # kein Re-Rastern: jeder gelieferte Frame landet in der Datei
+        vparts.append((bf, sum(max(1, round((s['v_out'] - s['v_in']) * FPS)) for s in chunk)))
+        print(f"[rerender]   Bild-Batch {bi//BATCH+1}/{(len(vsegs)+BATCH-1)//BATCH}", flush=True)
+    vid = os.path.join(tmp, "video.mp4")
+    if len(vparts) == 1:
+        os.replace(vparts[0][0], vid)
+    else:
+        # KRITISCH: explizite duration-Zeilen (Framezahl/FPS). Der mp4-Muxer
+        # meldet die Container-Dauer jedes Batches um genau EINE Bilddauer zu
+        # kurz (das letzte Sample hat keinen Folge-PTS). Der concat-Demuxer
+        # schiebt jede Folgedatei um die GEMELDETE Dauer nach hinten — pro
+        # Naht rutschte so alles 33 ms nach vorn (yt1b: 9 Batches = 267 ms
+        # Bild-vor-Ton am Ende, und -shortest schnitt den Ton entsprechend
+        # frueher ab -> fehlendes Schlusswort). Mit expliziten Dauern liegt
+        # jedes Bild exakt auf dem Raster — verifiziert per PTS-Scan ueber
+        # alle 47128 Pakete (max. Abweichung 0.00 ms).
+        lst = os.path.join(tmp, "lv.txt")
+        open(lst, "w").write("ffconcat version 1.0\n" + "".join(
+            f"file '{b}'\nduration {n / FPS:.6f}\n" for b, n in vparts))
+        run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+             "-i", lst, "-c", "copy", vid])
+
+    # ---- Tonkette: zwei alternierende Ketten + amix ----
+    AF = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+    jc = [float(s.get("jcut", 0) or 0) for s in asegs]
+    parts, chains = "", []
+    for par in (0, 1):
+        idx = [k for k in range(len(asegs)) if k % 2 == par]
+        if not idx:
+            continue
+        seq, cursor = "", 0.0
+        for n, k in enumerate(idx):
+            s = asegs[k]
+            # a_dur statt (out-in): die Tondauer folgt der frame-gerasteten
+            # Bilddauer, sonst driften beide wieder auseinander.
+            st = s["in"]
+            dur = float(s.get("a_dur", s["out"] - s["in"]))
+            e = st + dur
+            pos = s["a_start"]
+            gap = pos - cursor
+            if gap > 0.0005:                       # Stille bis zum Stueckanfang
+                parts += f"[1:a]atrim=0:{gap:.4f},asetpts=PTS-STARTPTS,{AF}[p{par}s{n}];"
+                seq += f"[p{par}s{n}]"
+            # NUR Declick-Fades (12ms), KEINE Kreuzblende ueber die Ueberlappung.
+            # Beide Toene sollen in voller Lautstaerke laufen: der vorherige
+            # Clip wird nicht leiser, der neue kommt darunter dazu. Eine
+            # Kreuzblende wuerde den vorherigen Ton faktisch kuerzen.
+            fin = min(FADE_S, dur / 2.0)
+            fout = min(FADE_S, dur / 2.0)
+            g = s.get("gain_db", 0.0)
+            vol = f",volume={g:.1f}dB" if abs(g) > 0.01 else ""
+            parts += (f"[0:a]atrim={st:.4f}:{e:.4f},asetpts=PTS-STARTPTS,"
+                      f"afade=t=in:st=0:d={fin:.4f},"
+                      f"afade=t=out:st={dur-fout:.4f}:d={fout:.4f}{vol},{AF}[p{par}a{n}];")
+            seq += f"[p{par}a{n}]"
+            cursor = pos + dur
+        nseg = seq.count("[")
+        parts += f"{seq}concat=n={nseg}:v=0:a=1[chain{par}];"
+        chains.append(f"[chain{par}]")
+    if len(chains) == 2:
+        fc = parts + f"{chains[0]}{chains[1]}amix=inputs=2:normalize=0:dropout_transition=0[a]"
+    else:
+        fc = parts + f"{chains[0]}anull[a]"
+    aud = os.path.join(tmp, "audio.m4a")
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+         "-filter_complex", fc, "-map", "[a]",
+         "-c:a", "aac", "-b:a", abr, "-ar", "48000", aud])
+    print(f"[rerender]   Tonkette fertig ({len(asegs)} Clips in 2 Ketten, "
+          f"{n_j} Ueberlappungen, beide Toene in voller Lautstaerke)", flush=True)
+
+    # ---- Muxen ----
+    # KEIN -shortest: beide Ketten sind per Konstruktion gleich lang. -shortest
+    # hatte den Ton an der (vorher zu kurz gemeldeten) Video-Dauer abgeschnitten
+    # — so fehlte das Schlusswort ("... im naechsten Video.").
+    base = os.path.join(tmp, "base.mp4")
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", vid, "-i", aud,
+         "-map", "0:v", "-map", "1:a", "-c", "copy", base])
+    assert_av_sync(base)
+    return base
+
+
 def render_segments(segs, src, out_mp4, mode, broll, workdir):
     """Schritt 4+5: Segmente rendern (per-Segment-Gain) + optionaler B-Roll-Pass."""
+    # Die Tonketten-Mechanik entscheidet ueber den Encoder, NICHT die Frage, ob
+    # echte J-Cuts vorliegen: seit dem 15.08.-Fix laeuft der Split-Pfad fuer
+    # JEDE Timeline (jcut=0 ist dort der Grenzfall), siehe has_jcut unten. Die
+    # Bedingung muss deshalb dieselbe sein — sonst bekommt jedes jcut-freie
+    # Projekt J-Cut-Tonketten MIT VideoToolbox, also genau die unten
+    # beschriebene verbotene Paarung. (mod4v8, 28.08.: gemessen 140 ms
+    # konstanter Tonversatz bei PTS-Raster 0,0003 ms und A/V-Dauerdiff 0,0 ms —
+    # weder Raster noch Container-Vergleich faengt das, nur Ton-gegen-Quelle.)
+    tonketten = (any(float(s.get("jcut", 0) or 0) > 1e-3 for s in segs)
+                 or bool(segs and "v_start" in segs[0]))
     if mode == "proxy":
         vf_extra = ",scale=-2:1080"
-        venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+        if tonketten:
+            # SPLIT-PFAD (J-Cut-Tonketten): bewiesene Software-Kombination
+            # (mod4v1: 0,2 ms PASS). Die Paarung J-Cut-Tonketten +
+            # h264_videotoolbox erzeugte einen konstanten 133-ms-A/V-Versatz
+            # (+4 Frames) ueber die ganze Datei (mod4v2, 15.08., verify FAIL)
+            # — bis zur Klaerung bleibt hier libx264.
+            venc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p"]
+        else:
+            # HARDWARE-ENCODER (15.08.): 3-5x schneller; nur noch fuer den
+            # alten concat-Normal-Pfad ohne Tonketten.
+            venc = ["-c:v", "h264_videotoolbox" if sys.platform == "darwin" else "libx264", "-b:v", "10M",
+                    "-profile:v", "high", "-pix_fmt", "yuv420p"]
+    elif mode == "max":
+        # Master-Qualitaet fuer den Upload. Dieser Schritt ist nur ein
+        # ZWISCHENprodukt (der Sync-Pass encodiert danach nochmal), deshalb hier
+        # praktisch verlustfrei: CRF 13 gibt der zweiten Generation genug
+        # Reserve. Der Hardware-Encoder (hevc_videotoolbox) waere zwar
+        # schneller, verliert bei gleicher Datenrate aber sichtbar mehr Details
+        # — und dieser Verlust waere danach nicht mehr aufzuholen.
+        vf_extra = ""
+        venc = ["-c:v", "libx264", "-preset", "fast", "-crf", "13", "-pix_fmt", "yuv420p"]
     else:
         vf_extra = ""
-        venc = (["-c:v", "hevc_videotoolbox", "-q:v", "55", "-tag:v", "hvc1", "-pix_fmt", "yuv420p"]
-                if sys.platform == "darwin"
-                else ["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p"])
+        venc = ["-c:v", "hevc_videotoolbox", "-q:v", "55", "-tag:v", "hvc1", "-pix_fmt", "yuv420p"]
+    abr = "320k" if mode == "max" else "192k"
 
-    pairs = [(s["in"], s["out"], s.get("gain_db", 0.0)) for s in segs if s["out"] > s["in"]]
-    print(f"[rerender] Render {len(pairs)} Segmente, mode={mode}", flush=True)
-    tmp = tempfile.mkdtemp(prefix="rer_"); batches = []
-    for bi in range(0, len(pairs), BATCH):
-        chunk = pairs[bi:bi + BATCH]; parts = ""; ci = ""
-        for k, (s, e, g) in enumerate(chunk):
-            fo = max(0.0, (e - s) - FADE_S)
-            vol = f",volume={g:.1f}dB" if abs(g) > 0.01 else ""
-            parts += (f"[0:v]trim={s:.4f}:{e:.4f},setpts=PTS-STARTPTS{vf_extra}[v{k}];"
-                      f"[0:a]atrim={s:.4f}:{e:.4f},asetpts=PTS-STARTPTS,"
-                      f"afade=t=in:st=0:d={FADE_S},afade=t=out:st={fo:.4f}:d={FADE_S}{vol}[a{k}];")
-            ci += f"[v{k}][a{k}]"
-        fc = parts + f"{ci}concat=n={len(chunk)}:v=1:a=1[v][a]"
-        bf = os.path.join(tmp, f"b{bi//BATCH:03d}.mp4")
-        run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-filter_complex", fc,
-             "-map", "[v]", "-map", "[a]", *venc, "-c:a", "aac", "-b:a", "192k",
-             "-ar", "48000", bf])
-        batches.append(bf)
-        print(f"[rerender]   Batch {bi//BATCH+1}/{(len(pairs)+BATCH-1)//BATCH}", flush=True)
-    base = os.path.join(tmp, "base.mp4")
-    if len(batches) == 1:
-        os.replace(batches[0], base)
+    # --- Renderpfad-Wahl (15.08.): IMMER der Split-Pfad, wenn die frame-
+    # gerasterten Kanten vorliegen (Timeline-Modus, apply_jcut_edges gelaufen).
+    # Er ist der bewiesene exakte Weg: mod4v1 misst darueber 0,2 ms Lippensync
+    # ueber 41 Clips (verify_render PASS). Der alte concat-Normal-Pfad behielt
+    # selbst nach dem Raster-Fix einen konstanten ~21-ms-Ton-Offset (AAC-
+    # Priming an den Batch-Naehten) und vereinzelte 2-Frame-Rasterstellen
+    # (mod4v4 FAIL). jcut=0 ist im Split-Pfad der saubere Grenzfall.
+    has_jcut = (any(float(s.get("jcut", 0) or 0) > 1e-3 for s in segs)
+                or bool(segs and "v_start" in segs[0]))
+    tmp = tempfile.mkdtemp(prefix="rer_")
+
+    if has_jcut:
+        base = render_base_split(segs, src, mode, vf_extra, venc, tmp)
     else:
-        lst = os.path.join(tmp, "l.txt")
-        open(lst, "w").write("".join(f"file '{b}'\n" for b in batches))
-        run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-             "-i", lst, "-c", "copy", base])
+        # FRAME-RASTER (15.08.): apply_jcut_edges legt die Bilddauern auf
+        # exakte 30fps-Vielfache (v_in/v_out) — der Normal-Pfad nutzte aber
+        # die ROHEN in/out. Der halbe Frame Rundung pro Segment akkumulierte
+        # ueber die concat-Kette (mod4v4: 110 Clips -> +680 ms Drift am Ende,
+        # verify_render FAIL; mod4v1 ueber den J-Cut-Pfad: 0,0 ms PASS).
+        # Fallback auf in/out fuer den Solver-Pfad ohne v_in/v_out.
+        pairs = [(s.get("v_in", s["in"]), s.get("v_out", s["out"]), s.get("gain_db", 0.0))
+                 for s in segs if s.get("v_out", s["out"]) > s.get("v_in", s["in"])]
+        print(f"[rerender] Render {len(pairs)} Segmente, mode={mode}", flush=True)
+        batches = []
+        for bi in range(0, len(pairs), BATCH):
+            chunk = pairs[bi:bi + BATCH]; parts = ""; ci = ""
+            for k, (s, e, g) in enumerate(chunk):
+                fo = max(0.0, (e - s) - FADE_S)
+                vol = f",volume={g:.1f}dB" if abs(g) > 0.01 else ""
+                parts += (f"[0:v]trim={s:.4f}:{e:.4f},setpts=PTS-STARTPTS,fps={FPS:g}{vf_extra}[v{k}];"
+                          f"[0:a]atrim={s:.4f}:{e:.4f},asetpts=PTS-STARTPTS,"
+                          f"afade=t=in:st=0:d={FADE_S},afade=t=out:st={fo:.4f}:d={FADE_S}{vol}[a{k}];")
+                ci += f"[v{k}][a{k}]"
+            fc = parts + f"{ci}concat=n={len(chunk)}:v=1:a=1[v][a]"
+            bf = os.path.join(tmp, f"b{bi//BATCH:03d}.mp4")
+            run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-filter_complex", fc,
+                 "-map", "[v]", "-map", "[a]", *venc, "-c:a", "aac", "-b:a", abr,
+                 "-ar", "48000", "-r", f"{FPS:g}", "-vsync", "cfr", bf])
+            batches.append(bf)
+            print(f"[rerender]   Batch {bi//BATCH+1}/{(len(pairs)+BATCH-1)//BATCH}", flush=True)
+        base = os.path.join(tmp, "base.mp4")
+        if len(batches) == 1:
+            os.replace(batches[0], base)
+        else:
+            lst = os.path.join(tmp, "l.txt")
+            open(lst, "w").write("".join(f"file '{b}'\n" for b in batches))
+            run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                 "-i", lst, "-c", "copy", base])
 
     # 5. B-Roll-Overlay-Pass (Zeiten beziehen sich auf die NEUE Proxy-Timeline)
+    #    ACHTUNG: Wenn ein Sync-Pass folgt (broll_sync.json existiert), rendert
+    #    DER die Slots — hier einbrennen wuerde die Facecam-Kreis-Quelle
+    #    zerstoeren (Kreis zeigte dann die Grafik statt Sebastians Gesicht).
     valid_broll = [b for b in broll if b.get("file") and os.path.exists(b["file"])
                    and b.get("end", 0) > b.get("start", 0)]
+    if valid_broll and os.path.exists(os.path.join(workdir, "broll_sync.json")):
+        print(f"[rerender] {len(valid_broll)} Slots -> rendert der Sync-Pass "
+              f"(Facecam-Quelle bleibt sauber)", flush=True)
+        valid_broll = []
     if valid_broll:
         print(f"[rerender] B-Roll-Pass: {len(valid_broll)} Slots", flush=True)
         probe = run(["ffprobe", "-v", "error", "-select_streams", "v",
@@ -198,17 +529,27 @@ def render_segments(segs, src, out_mp4, mode, broll, workdir):
         fc, prev = "", "0:v"
         for i, b in enumerate(valid_broll):
             inputs += ["-i", b["file"]]
-            fc += (f"[{i+1}:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
-                   f"crop={W}:{H},setpts=PTS-STARTPTS+{b['start']:.3f}/TB[br{i}];"
-                   f"[{prev}][br{i}]overlay=enable='between(t,{b['start']:.3f},{b['end']:.3f})'[o{i}];")
+            # src_in: Datei-Offset (frei geschnittene Grafik-B-Rolls zeigen den
+            # richtigen Ausschnitt; Legacy-Slots ohne src_in starten bei 0)
+            si = float(b.get("src_in", 0.0))
+            dur = b["end"] - b["start"]
+            fc += (f"[{i+1}:v]trim={si:.3f}:{si + dur + 0.5:.3f},setpts=PTS-STARTPTS,"
+                   f"fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,"
+                   f"crop={W}:{H},setsar=1,setpts=PTS+{b['start']:.3f}/TB[br{i}];"
+                   f"[{prev}][br{i}]overlay=eof_action=pass:enable='between(t,{b['start']:.3f},{b['end']:.3f})'[o{i}];")
             prev = f"o{i}"
         fc = fc.rstrip(";")
         overlaid = os.path.join(tmp, "overlaid.mp4")
         run(["ffmpeg", "-y", "-loglevel", "error", *inputs, "-filter_complex", fc,
              "-map", f"[{prev}]", "-map", "0:a", *venc,
              "-c:a", "copy", overlaid])
+        os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
         os.replace(overlaid, out_mp4)
     else:
+        # Zielordner anlegen: fehlt er (z.B. work/<name>/bench/), wirft
+        # os.replace einen FileNotFoundError, der so aussieht, als fehle die
+        # Quelldatei — der komplette Render war dann umsonst (29.07., v5m).
+        os.makedirs(os.path.dirname(out_mp4) or ".", exist_ok=True)
         os.replace(base, out_mp4)
 
     # 6. B-Roll-SYNC-Pass (broll_sync.json im Workdir): parallel aufgenommenes
@@ -219,8 +560,10 @@ def render_segments(segs, src, out_mp4, mode, broll, workdir):
     segs_eff = os.path.join(workdir, "segments_effective.json")
     if os.path.exists(sync_cfg) and os.path.exists(segs_eff):
         tmp_sync = out_mp4 + ".sync.mp4"
-        run([sys.executable, os.path.join(HERE, "broll_sync_pass.py"),
-             out_mp4, segs_eff, sync_cfg, tmp_sync, "--mode", mode])
+        r = run([sys.executable, os.path.join(HERE, "broll_sync_pass.py"),
+                 out_mp4, segs_eff, sync_cfg, tmp_sync, "--mode", mode])
+        if r.stdout:
+            print(r.stdout.rstrip(), flush=True)   # [sync]-Zeilen ins Log durchreichen
         os.replace(tmp_sync, out_mp4)
         print("[rerender] B-Roll-SYNC-Pass angewendet", flush=True)
     print(f"[rerender] FERTIG -> {out_mp4}", flush=True)

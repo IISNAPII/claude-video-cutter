@@ -25,8 +25,11 @@ Das ist das echte Produktions-Setup von [Sebastian Kauffmann](https://www.skool.
 4. **Prüft jede Naht** (QA-Pyramide mit Whisper-Gegencheck + Auto-Repair)
    und rendert einen Proxy mit Beweisen (A/V-Sync, Hör-Stichproben)
 5. **Übergibt ehrlich**: Review-Liste mit Graufällen + Cut-Cockpit im
-   Browser (Timeline, Trimmen, Splitten, Gain, B-Roll-Slots, Re-Render —
-   und rechts ein echtes Claude-Terminal mit dem Cutting-Agenten)
+   Browser (Timeline mit Waveforms, Trimmen, Splitten, Q/W/E-Quick-Cuts,
+   J-Cuts, Gain, B-Roll-/Screen-Slots mit Facecam-Kreis, T-Markierung für
+   B-Roll-Briefings, All-Intra-Playback-Proxy für butterweiches Scrubbing,
+   Re-Render — und rechts ein echtes Claude-Terminal mit dem Cutting-Agenten).
+   `cockpit_setup.py` richtet jedes Workdir idempotent ein und prüft es.
 
 Philosophie: **Agent = Regie, Code = Kamera.** Der Agent entscheidet WAS
 geschnitten wird, deterministischer Code entscheidet WO. Ziel sind 90%+

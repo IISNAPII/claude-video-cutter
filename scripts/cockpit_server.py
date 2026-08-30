@@ -13,6 +13,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import struct
@@ -32,6 +33,41 @@ else:
         import winpty  # type: ignore
     except ImportError:  # pragma: no cover
         winpty = None
+# ---------------------------------------------------------------------------
+# PATH-Reparatur (28.07.2026) — MUSS vor jedem subprocess-Aufruf stehen.
+# Das Obsidian-Plugin startet uns mit PATH=/usr/bin:/bin:/usr/sbin:/sbin.
+# Darin fehlt ffmpeg/ffprobe (Homebrew). Folge frueher: broll_sync_info()
+# lief in FileNotFoundError, ein stilles `except: return None` machte daraus
+# brollSync=null — und damit war die Sticky-B-Roll-Kopplung, die
+# Composite-Preview UND "Neu rendern" tot, ohne jede Fehlermeldung.
+# Sebastian sah nur "die Regeln sind schon wieder weg".
+#
+# 31.07.2026 — dieselbe Falle nochmal, diesmal fuer das eingebettete Terminal:
+# `claude` liegt unter ~/.npm-global/bin und stand NICHT in dieser Liste. Der
+# PTY startete `zsh -lc "claude …"`, und weil eine nicht-interaktive
+# Login-Shell zwar .zprofile, aber NICHT .zshrc liest (dort steht der
+# npm-global-Pfad), endete das in `command not found: claude`. Der Prozess
+# starb sofort, hinterliess einen Zombie, und im Cockpit blieb die rechte
+# Spalte einfach leer.
+_HOME = os.path.expanduser("~")
+for _p in ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin",
+           "/opt/homebrew/sbin",
+           os.path.join(_HOME, ".npm-global/bin"),
+           os.path.join(_HOME, ".local/bin"),
+           os.path.join(_HOME, "bin")):
+    if os.path.isdir(_p) and _p not in os.environ.get("PATH", "").split(":"):
+        os.environ["PATH"] = _p + ":" + os.environ.get("PATH", "")
+
+
+def tool_health():
+    """Sind die externen Werkzeuge erreichbar? Wird beim Start geloggt und
+    ueber /api/state ans Frontend gemeldet (rotes Banner statt stiller Ausfall)."""
+    out = {}
+    for t in ("ffprobe", "ffmpeg", "claude"):
+        out[t] = shutil.which(t)
+    return out
+
+
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -100,6 +136,8 @@ def read_overrides():
     ovr.setdefault("gains", {})
     ovr.setdefault("broll", [])
     ovr.setdefault("broll_sync_off", [])   # Clip-IDs ohne Sync-B-Roll-Overlay
+    ovr.setdefault("broll_sync_holes", []) # [[srcA,srcB],...] Ausblend-Fenster (Source-Zeit)
+    ovr.setdefault("broll_sync_converted", [])  # Sync-Quellen-Namen, die in freie Slots umgewandelt wurden
     ovr.setdefault("extra_cut_word_ids", [])
     ovr.setdefault("uncut_word_ids", [])
     ovr.setdefault("deleted_segments", [])
@@ -107,11 +145,38 @@ def read_overrides():
     return ovr
 
 
-_BROLL_SYNC = {"info": None, "mtime": None}
+_BROLL_SYNC = {"info": None, "mtime": None, "error": None}
+
+
+def file_key(path):
+    """Stabiler Schluessel aus dem Dateipfad (djb2, 32 Bit, base36).
+
+    MUSS bitgleich zu fileKey() in cockpit/index.html sein — dort wird die
+    Media-URL damit gebildet. Frueher lief das ueber den Listen-Index; beim
+    Loeschen eines Slots verschob sich die Liste und jeder folgende Slot
+    lieferte die Datei seines Vorgaengers.
+    """
+    h = 5381
+    for ch in path:
+        h = ((h << 5) + h + ord(ch)) & 0xFFFFFFFF
+    if h == 0:
+        return "0"
+    ziffern = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while h:
+        h, r = divmod(h, 36)
+        out = ziffern[r] + out
+    return out
 
 
 def broll_sync_info():
-    """broll_sync.json des Workdirs + B-Roll-Dauer (ffprobe, gecacht)."""
+    """broll_sync.json des Workdirs + Quell-Dauern (ffprobe, gecacht).
+
+    Multi-Source (saas7+): {"sources":[{name,file,src_offset,window?},...]}.
+    Legacy-Single ({"file","src_offset"}) wird konvertiert. Liefert
+    {"sources":[...], "pip":{...}} + Legacy-Top-Level-Felder (erste Quelle)
+    fuer aeltere Frontends.
+    """
     path = os.path.join(CFG["workdir"], "broll_sync.json")
     if not os.path.exists(path):
         return None
@@ -120,28 +185,107 @@ def broll_sync_info():
         return _BROLL_SYNC["info"]
     try:
         cfg = json.load(open(path))
-        f = cfg.get("file")
-        if not f or not os.path.exists(f):
-            return None
-        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                            "format=duration", "-of", "csv=p=0", f],
-                           capture_output=True, text=True)
-        dur = float((r.stdout or "0").strip() or 0)
-        info = {"file": f, "name": os.path.basename(f),
-                "src_offset": float(cfg.get("src_offset", 0)), "duration": dur,
-                "pip": cfg.get("pip", {})}
+        raw = cfg.get("sources")
+        if raw is None:
+            raw = [{"name": None, "file": cfg.get("file"),
+                    "src_offset": cfg.get("src_offset", 0)}]
+        sources = []
+        for s in raw:
+            f = s.get("file")
+            if not f or not os.path.exists(f):
+                continue
+            r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                "format=duration", "-of", "csv=p=0", f],
+                               capture_output=True, text=True)
+            dur = float((r.stdout or "0").strip() or 0)
+            off = float(s.get("src_offset", 0))
+            win = s.get("window") or [off, off + dur]
+            pos = len(sources)
+            sources.append({
+                "i": pos, "file": f,
+                "name": s.get("name") or os.path.basename(f),
+                "src_offset": off, "duration": dur,
+                "win_a": max(float(win[0]), off),
+                "win_b": min(float(win[1]), off + dur),
+                "url": f"/media/broll_{pos}.mp4",
+            })
+        if not sources:
+            # Zwei sehr verschiedene Faelle, die frueher beide als "kaputt"
+            # gemeldet wurden:
+            #  a) Quellen sind DEKLARIERT, die Dateien fehlen -> echter Fehler
+            #  b) Es sind bewusst KEINE Quellen eingetragen (Projekt hat nur
+            #     Grafik-Slots, z.B. v8d) -> voellig in Ordnung, kein Banner
+            deklariert = [s.get("file") for s in raw if s.get("file")]
+            if deklariert:
+                _BROLL_SYNC["error"] = "Quelldatei nicht gefunden: " + ", ".join(
+                    os.path.basename(x) for x in deklariert[:3])
+                return None
+            info = {"sources": [], "pip": cfg.get("pip", {}),
+                    "file": None, "name": None, "src_offset": 0, "duration": 0}
+            _BROLL_SYNC["info"] = info
+            _BROLL_SYNC["mtime"] = mtime
+            _BROLL_SYNC["error"] = None
+            return info
+        first = sources[0]
+        info = {"sources": sources, "pip": cfg.get("pip", {}),
+                # Legacy-Felder (erste Quelle) fuer Rueckwaertskompatibilitaet:
+                "file": first["file"], "name": first["name"],
+                "src_offset": first["src_offset"], "duration": first["duration"]}
         _BROLL_SYNC["info"] = info
         _BROLL_SYNC["mtime"] = mtime
         return info
-    except Exception:
+    except Exception as e:
+        # NIE stumm scheitern — genau das hat am 27./28.07. tagelang die
+        # Sticky-Kopplung lahmgelegt, ohne dass irgendwo etwas zu sehen war.
+        import traceback
+        print("[cockpit] FEHLER beim Laden von broll_sync.json: %r" % (e,), flush=True)
+        traceback.print_exc()
+        _BROLL_SYNC["error"] = "%s: %s" % (type(e).__name__, e)
         return None
 
 
 def write_overrides_atomic(ovr):
-    """Schreibt Overrides atomar (tmp + os.replace)."""
+    """Schreibt Overrides atomar (tmp + os.replace) — mit Versionshistorie.
+
+    Am 29.07. ging der Slot-Stand von v8d verloren (209 -> 1) und es gab NICHTS
+    zum Zurueckholen: der Server ueberschrieb den Vorstand ersatzlos. Seitdem
+    wandert jede Fassung vor dem Ueberschreiben nach backups/hist/ (die letzten
+    40), und ein Save, der massiv Material entfernt, bekommt zusaetzlich eine
+    deutlich benannte Kopie.
+    """
     path = CFG["overrides_path"]
     tmp = path + ".tmp"
     with _OVR_LOCK:
+        # 1) Vorstand sichern
+        try:
+            if os.path.exists(path):
+                hist = os.path.join(os.path.dirname(path), "backups", "hist")
+                os.makedirs(hist, exist_ok=True)
+                alt = load_json(path, {}) or {}
+                a_slots, a_clips = len(alt.get("broll") or []), len(alt.get("timeline_clips") or [])
+                n_slots, n_clips = len(ovr.get("broll") or []), len(ovr.get("timeline_clips") or [])
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                shutil.copy2(path, os.path.join(hist, "ovr_%s.json" % stamp))
+                # 2) Auffaelliger Verlust -> eigene, gut auffindbare Kopie + Log
+                drastisch = (a_slots >= 10 and n_slots < a_slots * 0.5) or \
+                            (a_clips >= 10 and n_clips < a_clips * 0.5)
+                if drastisch:
+                    warn = os.path.join(os.path.dirname(path),
+                                        "backups", "VORHER_GROSSER_VERLUST_%s.json" % stamp)
+                    shutil.copy2(path, warn)
+                    print("[cockpit] ACHTUNG: Save entfernt viel Material "
+                          "(Slots %d->%d, Clips %d->%d). Vorstand gesichert: %s"
+                          % (a_slots, n_slots, a_clips, n_clips, warn), flush=True)
+                # 3) Historie begrenzen
+                dateien = sorted(os.listdir(hist))
+                for f in dateien[:-40]:
+                    try:
+                        os.remove(os.path.join(hist, f))
+                    except OSError:
+                        pass
+        except Exception as e:
+            print("[cockpit] Backup vor dem Speichern fehlgeschlagen: %r" % (e,), flush=True)
+        # 4) eigentliches Schreiben
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(ovr, f, ensure_ascii=False, indent=2)
             f.flush()
@@ -237,7 +381,7 @@ def compute_peaks():
         except OSError:
             pass
         _PEAKS["data"] = data
-        _PEAKS["mtime"] = seg_mtime
+        _PEAKS["mtime"] = audio_mtime
         return data
 
 
@@ -259,6 +403,7 @@ TERM_BUF_MAX = 400_000
 TERM_AGENT = "video-cutter"
 
 
+
 def _term_fail(msg):
     """Fehlermeldung als Terminal-Output anzeigen statt still zu sterben."""
     with TERM["lock"]:
@@ -277,9 +422,17 @@ def _term_start_windows(cols=120, rows=32):
             return _term_fail("claude nicht im PATH gefunden - ist Claude Code installiert?")
         env = dict(os.environ)
         env["TERM"] = "xterm-256color"
+        # npm-Installationen liefern einen claude.cmd-Shim, den ConPTY nicht
+        # direkt starten kann -> echte .exe suchen, sonst ueber cmd.exe starten.
+        if exe.lower().endswith((".cmd", ".bat")):
+            native = os.path.expandvars(r"%USERPROFILE%\.local\bin\claude.exe")
+            argv = [native, "--agent", TERM_AGENT] if os.path.exists(native) \
+                else ["cmd.exe", "/c", exe, "--agent", TERM_AGENT]
+        else:
+            argv = [exe, "--agent", TERM_AGENT]
         try:
             proc = winpty.PtyProcess.spawn(
-                [exe, "--agent", TERM_AGENT],
+                argv,
                 cwd=os.path.dirname(HERE),
                 env=env,
                 dimensions=(int(rows), int(cols)),
@@ -320,12 +473,29 @@ def term_start(cols=120, rows=32):
     with TERM["lock"]:
         if TERM["alive"]:
             return
+        # ABSOLUTEN Pfad aufloesen statt auf den Shell-PATH zu hoffen: eine
+        # nicht-interaktive Login-Shell liest .zprofile, aber NICHT .zshrc —
+        # dort steht bei npm-global-Installationen aber der Pfad zu `claude`.
+        claude_bin = shutil.which("claude")
         pid, fd = pty.fork()
         if pid == 0:
             # Kind: claude im Login-Shell-Kontext starten (PATH/nvm etc.)
             os.chdir(os.path.dirname(HERE))
             os.environ["TERM"] = "xterm-256color"
-            os.execvp("/bin/zsh", ["/bin/zsh", "-lc", "claude --agent %s" % TERM_AGENT])
+            if not claude_bin:
+                # Nicht still sterben — sonst bleibt die rechte Spalte leer und
+                # niemand weiss warum (genau so ist es am 31.07. passiert).
+                sys.stdout.write(
+                    "\r\n  claude wurde nicht gefunden.\r\n\r\n"
+                    "  PATH: %s\r\n\r\n"
+                    "  Erwartet z.B. unter ~/.npm-global/bin/claude.\r\n"
+                    "  Cockpit-Server mit vollem PATH neu starten.\r\n" %
+                    os.environ.get("PATH", ""))
+                sys.stdout.flush()
+                time.sleep(3600)
+                os._exit(1)
+            os.execvp("/bin/zsh", ["/bin/zsh", "-lc",
+                                   "%s --agent %s" % (shlex.quote(claude_bin), TERM_AGENT)])
         TERM["fd"] = fd
         TERM["pid"] = pid
         TERM["buf"] = b""
@@ -347,10 +517,16 @@ def _term_reader():
                 subs = list(TERM["subs"])
             for q in subs:
                 q.put(None)
-            try:
-                os.waitpid(TERM["pid"], os.WNOHANG)
-            except (OSError, TypeError):
-                pass
+            # Zombie sicher abraeumen: WNOHANG allein greift oft zu frueh
+            # (das Kind ist beim leeren read noch nicht als beendet vermerkt),
+            # dann bleiben <defunct>-Eintraege stehen.
+            for _try in range(20):
+                try:
+                    if os.waitpid(TERM["pid"], os.WNOHANG)[0]:
+                        break
+                except (OSError, TypeError):
+                    break
+                time.sleep(0.05)
             return
         with TERM["lock"]:
             TERM["buf"] = (TERM["buf"] + data)[-TERM_BUF_MAX:]
@@ -466,9 +642,62 @@ class Handler(BaseHTTPRequestHandler):
                 return self.serve_media(CFG.get("proxy_path"))
             if route == "/media/source.mp4":
                 return self.serve_media(CFG.get("src_video"))
+            if route == "/media/audio48k.wav":
+                # Eigene, kleine Tonquelle fuer die L-Cut-Tonspuren: PCM-WAV
+                # seekt byte-genau (keine GOP, kein Decoder-Reset) und haengt
+                # nicht mehr an der grossen Quelldatei.
+                return self.serve_media(CFG.get("audio_path"))
             if route == "/media/broll.mp4":
                 info = broll_sync_info()
                 return self.serve_media(info["file"] if info else None)
+            if route.startswith("/media/broll_key_") and route.endswith(".mp4"):
+                # Datei-Schluessel statt Listen-Index: bleibt gueltig, egal ob
+                # Slots geloescht, verschoben oder noch nicht gespeichert sind.
+                key = route[len("/media/broll_key_"):-len(".mp4")]
+                treffer = None
+                for b in read_overrides().get("broll", []):
+                    f = b.get("file")
+                    if f and file_key(f) == key:
+                        treffer = f
+                        break
+                if treffer is None:
+                    for q in ((broll_sync_info() or {}).get("sources") or []):
+                        if file_key(q["file"]) == key:
+                            treffer = q["file"]
+                            break
+                return self.serve_media(treffer if treffer and os.path.exists(treffer) else None)
+            if route.startswith("/media/broll_slotfile_") and route.endswith(".mp4"):
+                # Slot-Datei nach Index in der DEDUPLIZIERTEN Datei-Liste —
+                # stabil auch fuer frisch gesplittete, ungespeicherte Slots.
+                try:
+                    k = int(route[len("/media/broll_slotfile_"):-len(".mp4")])
+                except ValueError:
+                    k = -1
+                files = []
+                for b in read_overrides().get("broll", []):
+                    f = b.get("file")
+                    if f and f not in files:
+                        files.append(f)
+                f = files[k] if 0 <= k < len(files) else None
+                return self.serve_media(f if f and os.path.exists(f) else None)
+            if route.startswith("/media/broll_slot_") and route.endswith(".mp4"):
+                # Freie B-Roll-Slots (overrides.broll) — Index in der Liste
+                try:
+                    k = int(route[len("/media/broll_slot_"):-len(".mp4")])
+                except ValueError:
+                    k = -1
+                slots = read_overrides().get("broll", [])
+                f = slots[k].get("file") if 0 <= k < len(slots) else None
+                return self.serve_media(f if f and os.path.exists(f) else None)
+            if route.startswith("/media/broll_") and route.endswith(".mp4"):
+                info = broll_sync_info()
+                try:
+                    k = int(route[len("/media/broll_"):-len(".mp4")])
+                except ValueError:
+                    k = -1
+                srcs = (info or {}).get("sources") or []
+                f = srcs[k]["file"] if 0 <= k < len(srcs) else None
+                return self.serve_media(f)
             if route == "/api/term/stream":
                 return self.serve_term_stream()
             if route.startswith("/vendor/"):
@@ -491,6 +720,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route == "/api/overrides":
                 return self.save_overrides()
+            if route == "/api/broll_request":
+                return self.broll_request()
             if route == "/api/rerender":
                 return self.rerender()
             if route == "/api/term/input":
@@ -509,6 +740,117 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             except Exception:
                 pass
+
+    # ---------- B-Roll-Auftrag (T-Marker) ----------
+    def broll_request(self):
+        """Sebastian markiert mit T einen Bereich -> Briefing bauen, ablegen und
+        als Auftrag in die laufende Claude-Terminal-Session schreiben.
+        Fire-and-forget: kehrt sofort zurueck, er arbeitet weiter."""
+        body = self._read_post_json()
+        try:
+            a = float(body.get("start")); b = float(body.get("end"))
+        except (TypeError, ValueError):
+            return self._send_json({"error": "start/end fehlen"}, HTTPStatus.BAD_REQUEST)
+        if b <= a:
+            return self._send_json({"error": "leerer Bereich"}, HTTPStatus.BAD_REQUEST)
+        wunsch = (body.get("prompt") or "").strip()
+
+        ovr = read_overrides()
+        clips = ovr.get("timeline_clips") or []
+        if not clips:
+            seg_doc = load_json(CFG["segments_path"], {})
+            clips = [{"in": x["in"], "out": x["out"]}
+                     for x in (seg_doc.get("segments") or []) if x["out"] > x["in"]]
+
+        def raw_ranges(oa, ob):
+            res, cum = [], 0.0
+            for c in clips:
+                d = c["out"] - c["in"]
+                x, y = max(oa, cum), min(ob, cum + d)
+                if y > x:
+                    res.append((c["in"] + (x - cum), c["in"] + (y - cum)))
+                cum += d
+            return res
+
+        def out_to_raw(t):
+            r = raw_ranges(t, t + 0.001)
+            return round(r[0][0], 3) if r else 0.0
+
+        words = load_json(os.path.join(CFG["workdir"], "words_aai.json"), []) or []
+
+        def text_for(oa, ob):
+            out = []
+            for (ra, rb) in raw_ranges(max(0.0, oa), ob):
+                out += [w["text"] for w in words
+                        if w["start"] >= ra - 0.01 and w["end"] <= rb + 0.01]
+            return " ".join(out).strip()
+
+        def visual_at(t):
+            best = None
+            for sl in ovr.get("broll", []):
+                if not sl.get("file"):
+                    continue
+                if float(sl.get("start", 0)) <= t <= float(sl.get("end", 0)):
+                    if sl.get("kind") != "screen":
+                        return "Grafik '%s'" % sl.get("name", "?")
+                    best = best or "Bildschirmaufnahme"
+            return best or "Talking-Head (Sprecher fullscreen)"
+
+        total = sum(c["out"] - c["in"] for c in clips)
+        tc = lambda t: "%d:%02d" % (int(t // 60), int(t % 60))
+        brief = {
+            "typ": "broll_auftrag",
+            "erstellt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "projekt": os.path.basename(os.path.abspath(CFG["workdir"])),
+            "workdir": os.path.abspath(CFG["workdir"]),
+            "quellvideo": CFG.get("src_video"),
+            "zielbereich": {
+                "output_start": round(a, 3), "output_end": round(b, 3),
+                "dauer_s": round(b - a, 3),
+                "output_start_tc": tc(a), "output_end_tc": tc(b),
+                "roh_bereiche": [[round(x, 3), round(y, 3)] for x, y in raw_ranges(a, b)],
+                "anchor_fuer_slot": out_to_raw(a),
+            },
+            "gesagt_im_bereich": text_for(a, b),
+            "kontext_davor_30s": text_for(a - 30, a),
+            "kontext_danach_30s": text_for(b, b + 30),
+            "sichtbar": {
+                "davor": visual_at(max(0.0, a - 0.5)),
+                "im_bereich": visual_at((a + b) / 2.0),
+                "danach": visual_at(min(total, b + 0.5)),
+            },
+            "vorhandene_grafiken": [
+                {"name": sl.get("name"), "datei": sl.get("file"),
+                 "start": sl.get("start"), "end": sl.get("end")}
+                for sl in ovr.get("broll", [])
+                if sl.get("kind") != "screen" and sl.get("file")
+            ],
+            "wunsch_von_sebastian": wunsch,
+            "einbau_hinweis": (
+                "Fertige Szene als FREIEN Slot in cockpit_overrides.json broll[] eintragen: "
+                "{kind:'free', file:<mp4>, start:%.3f, end:<start+dauer>, src_in:0, "
+                "anchor:%.3f, name:'<kurz>'}. Screen-Slots NICHT anfassen. "
+                "Stil: yt1-broll/src/PluginScenes.tsx (SKAILE/VSL-Look). "
+                "Facecam-Freihaltezone unten rechts (x>1430, y>580) freilassen. "
+                "Uebergang zum Davor/Danach sauber gestalten."
+            ) % (a, out_to_raw(a)),
+        }
+        reqdir = os.path.join(CFG["workdir"], "broll_requests")
+        os.makedirs(reqdir, exist_ok=True)
+        path = os.path.join(reqdir, "req-%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+        with open(path, "w") as f:
+            json.dump(brief, f, ensure_ascii=False, indent=1)
+
+        kurz = (brief["gesagt_im_bereich"] or "")[:110].replace('"', "'")
+        line = ("[B-ROLL-AUFTRAG] Lies %s und baue die dort beschriebene Grafik-B-Roll "
+                "(Bereich %s-%s, %.1fs). Gesagt wird dort: \"%s\". %s"
+                "Szene bauen, rendern, als freien Slot eintragen, dann kurz Bescheid geben."
+                % (path, tc(a), tc(b), b - a, kurz,
+                   ("Wunsch: %s. " % wunsch) if wunsch else ""))
+        sent = term_write(line.encode("utf-8") + b"\r")
+        print("[cockpit] B-Roll-Auftrag -> %s (Terminal: %s)"
+              % (os.path.basename(path), "ok" if sent else "nicht erreichbar"), flush=True)
+        self._send_json({"ok": True, "request": path, "terminal": bool(sent)})
 
     # --- Claude-Terminal + Vendor ------------------------------------------
     VENDOR_FILES = {
@@ -611,9 +953,21 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- Routen-Implementierung -------------------------------------------
     def serve_index(self):
-        with open(INDEX_HTML, "rb") as f:
+        # PROJEKT-OVERRIDE (14.08.): Liegt im Workdir eine index_override.html,
+        # wird DIESE ausgeliefert statt der globalen Fassung. Damit kann ein
+        # einzelnes Projekt (A/B-Test, z.B. mod4v2 mit dem 05.08.-Stand) eine
+        # andere Player-Version fahren, ohne die uebrigen Projekte anzufassen.
+        index_path = INDEX_HTML
+        override = os.path.join(CFG.get("workdir") or "", "index_override.html")
+        if CFG.get("workdir") and os.path.exists(override):
+            index_path = override
+        with open(index_path, "rb") as f:
             data = f.read()
-        self._send_bytes(data, "text/html; charset=utf-8")
+        # no-store: Browser darf das Cockpit-Frontend NIE cachen, sonst kommen
+        # Code-Updates beim Reload nicht an (Bug 22.07.: alte Selektions-Logik
+        # blieb trotz Fix haengen).
+        self._send_bytes(data, "text/html; charset=utf-8",
+                         extra_headers={"Cache-Control": "no-store"})
 
     def serve_state(self):
         words = load_json(CFG["words_path"], [])
@@ -623,6 +977,20 @@ class Handler(BaseHTTPRequestHandler):
         qa = load_json(CFG["qa_path"], [])
         ovr = read_overrides()
         joint_times = compute_joint_times(segments, ovr)
+        # MEDIA-HOST-SPLIT (14.08., Chromium-Recherche): Chromium erlaubt 6
+        # Verbindungen pro (Schema,Host,Port). Auf dem Haupt-Port haengen 4
+        # Video-Elemente + B-Roll-Layer + der permanente Terminal-SSE-Stream —
+        # das Budget war voll, jeder Naht-Seek wartete in der Socket-Queue.
+        # Media laeuft deshalb ueber einen eigenen Port (= eigene Gruppe).
+        mb = ("http://127.0.0.1:%d" % CFG["media_port"]) if CFG.get("media_port") else ""
+        bs_info = broll_sync_info()
+        if bs_info and mb:
+            bs_info = dict(bs_info)
+            if bs_info.get("sources"):
+                bs_info["sources"] = [
+                    dict(q, url=(mb + q["url"]) if str(q.get("url", "")).startswith("/") else q.get("url"))
+                    for q in bs_info["sources"]
+                ]
         state = {
             "words": words,
             "decisions": decisions,
@@ -634,13 +1002,26 @@ class Handler(BaseHTTPRequestHandler):
             },
             "qa": qa,
             "overrides": ovr,
+            "overridesMtime": (os.path.getmtime(CFG["overrides_path"]) if os.path.exists(CFG["overrides_path"]) else None),
             "jointTimes": joint_times,
-            "proxyUrl": "/media/proxy.mp4",
-            "sourceUrl": ("/media/source.mp4"
+            "proxyUrl": mb + "/media/proxy.mp4",
+            "sourceUrl": ((mb + "/media/source.mp4")
                           if CFG.get("src_video") and os.path.exists(CFG["src_video"])
                           else None),
-            "brollSync": broll_sync_info(),
-            "brollUrl": ("/media/broll.mp4" if broll_sync_info() else None),
+            "audioUrl": ((mb + "/media/audio48k.wav")
+                         if os.path.exists(CFG.get("audio_path") or "") else None),
+            "audioAligned": bool(CFG.get("audio_aligned")),
+            "mediaBase": mb,
+            "playbackProxy": bool(CFG.get("playback_map")),
+            "brollSync": bs_info,
+            "brollUrl": ((mb + "/media/broll.mp4") if bs_info else None),
+            # Selbstdiagnose fuers Frontend-Banner: was fehlt, wenn etwas fehlt
+            "health": {
+                "tools": tool_health(),
+                "brollSyncFile": os.path.exists(os.path.join(CFG["workdir"], "broll_sync.json")),
+                "brollSyncError": _BROLL_SYNC.get("error"),
+                "srcVideo": bool(CFG.get("src_video") and os.path.exists(CFG.get("src_video") or "")),
+            },
             "paths": {
                 "workdir": CFG["workdir"],
                 "overrides": CFG["overrides_path"],
@@ -708,11 +1089,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def serve_media(self, path):
         """Video-Datei mit HTTP-Range-Support (fuer Browser-Seeking noetig)."""
+        # PLAYBACK-PROXY (14.08.): Fuer die WIEDERGABE wird — wenn vorhanden —
+        # die All-Intra-Fassung (edit_intra_*.mp4, GOP=1) ausgeliefert. Ein
+        # Seek kostet dort 1 Frame-Decode statt einer GOP-Aufholstrecke auf
+        # der Long-GOP-Quelldatei; diese Aufholstrecke (250-3000 ms) war die
+        # gemeinsame Wurzel der 7 Naht-Bugs (Sim-A/B 14.08.: Trim-Replay bei
+        # Seek 400 ms = 28-32 Kaltspruenge, bei Seek 40 ms = 0).
+        # Render und alle Datei-Operationen nutzen weiterhin die Originale.
+        mapped = CFG.get("playback_map") or {}
+        if path:
+            p_abs = os.path.abspath(path)
+            if p_abs in mapped and os.path.exists(mapped[p_abs]):
+                path = mapped[p_abs]
         if not path or not os.path.exists(path):
             return self._send_json({"error": "media not found"}, HTTPStatus.NOT_FOUND)
         file_size = os.path.getsize(path)
         range_header = self.headers.get("Range")
-        ctype = "video/mp4"
+        ctype = "audio/wav" if path.lower().endswith(".wav") else "video/mp4"
 
         if range_header:
             m = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
@@ -742,6 +1135,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, file_size))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(length))
+            # CACHE-FIX 30.08.2026: Ohne no-store cachte Electron/Chrome alte
+            # Video-Bytes ueber einen Dateitausch hinweg (V6-Intra: Sebastian
+            # hoerte tagelang die ALTE, versetzte Fassung trotz Fix + Reload).
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self._stream_file(path, start, length)
         else:
@@ -749,6 +1146,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", ctype)
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(file_size))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self._stream_file(path, 0, file_size)
 
@@ -781,11 +1179,31 @@ class Handler(BaseHTTPRequestHandler):
             "gains": incoming.get("gains", {}) or {},
             "broll": incoming.get("broll", []) or [],
             "broll_sync_off": incoming.get("broll_sync_off", []) or [],
+            "broll_sync_holes": incoming.get("broll_sync_holes", []) or [],
+            "broll_sync_converted": incoming.get("broll_sync_converted", []) or [],
             "extra_cut_word_ids": incoming.get("extra_cut_word_ids", []) or [],
             "uncut_word_ids": incoming.get("uncut_word_ids", []) or [],
             "deleted_segments": incoming.get("deleted_segments", []) or [],
             "splits": incoming.get("splits", []) or [],
         }
+        # STALE-TAB-SCHUTZ (27.07.): Ein Tab, der vor einer externen Aenderung
+        # geladen wurde, darf den neueren Stand NICHT stillschweigend
+        # ueberschreiben. Bei Konflikt landet der eingehende Stand in einer
+        # Sidecar-Datei (nichts geht je verloren) und der Client wird gewarnt.
+        base_mtime = incoming.get("base_mtime")
+        try:
+            cur_mtime = os.path.getmtime(CFG["overrides_path"])
+        except OSError:
+            cur_mtime = None
+        if (base_mtime is not None and cur_mtime is not None
+                and abs(float(base_mtime) - cur_mtime) > 1.0):
+            side = CFG["overrides_path"].replace(".json", ".CONFLICT-%d.json" % int(cur_mtime))
+            with open(side, "w") as f:
+                json.dump(ovr, f, ensure_ascii=False, indent=1)
+            print("[cockpit] KONFLIKT: veralteter Tab -> %s" % side, flush=True)
+            return self._send_json({"ok": False, "conflict": True, "saved_to": side,
+                                    "message": "Datei wurde extern geaendert — Tab neu laden"},
+                                   HTTPStatus.CONFLICT)
         write_overrides_atomic(ovr)
         seg_doc = load_json(CFG["segments_path"], {})
         segments = seg_doc.get("segments", []) if isinstance(seg_doc, dict) else []
@@ -852,6 +1270,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    _h = tool_health()
+    _fehlt = [t for t, p_ in _h.items() if not p_]
+    if _fehlt:
+        print("[cockpit] ⚠ WERKZEUG FEHLT IM PATH: %s — B-Roll-Sync und Render "
+              "funktionieren nicht!" % ", ".join(_fehlt), flush=True)
+    else:
+        print("[cockpit] Werkzeuge ok: %s" % ", ".join(
+            "%s=%s" % (k, v) for k, v in _h.items()), flush=True)
     if len(sys.argv) < 4:
         print(__doc__)
         sys.exit(1)
@@ -884,6 +1310,69 @@ def main():
     CFG["src_video"] = src_video
     CFG["port"] = port
 
+    # PLAYBACK-PROXY (14.08.): All-Intra-Fassungen (edit_intra_*.mp4) im
+    # Workdir werden fuer die WIEDERGABE ausgeliefert (GOP=1 -> Seek kostet
+    # 1 Frame-Decode statt einer Aufholstrecke von 250-3000 ms auf der
+    # Long-GOP-Quelle). Original bleibt Quelle fuer Render + alle Messungen.
+    # Bauen: ffmpeg -i quelle -c:v libx264 -g 1 -bf 0 -crf 23 -preset veryfast
+    #        -tune fastdecode -vsync cfr -c:a copy -movflags +faststart out.mp4
+    playback_map = {}
+    edit_main = os.path.join(workdir, "edit_intra_main.mp4")
+    if src_video and os.path.exists(edit_main):
+        playback_map[os.path.abspath(src_video)] = edit_main
+    _bs = load_json(os.path.join(workdir, "broll_sync.json"), {}) or {}
+    _bs_sources = _bs.get("sources") or ([_bs] if _bs.get("file") else [])
+    for _i, _q in enumerate(_bs_sources):
+        _f = _q.get("file")
+        if not _f:
+            continue
+        _cand = os.path.join(
+            workdir,
+            "edit_intra_broll.mp4" if _i == 0 else "edit_intra_broll%d.mp4" % (_i + 1))
+        if os.path.exists(_cand):
+            playback_map[os.path.abspath(_f)] = _cand
+    CFG["playback_map"] = playback_map
+    for _a, _b in playback_map.items():
+        print("[cockpit] Playback-Proxy aktiv: %s -> %s"
+              % (os.path.basename(_a), os.path.basename(_b)), flush=True)
+    if src_video and os.path.exists(src_video) and not playback_map:
+        print("[cockpit] ⚠ Kein Playback-Proxy (edit_intra_main.mp4 fehlt) — "
+              "Wiedergabe seekt auf der Long-GOP-Quelle (Naht-Ruckler moeglich).",
+              flush=True)
+
+    # WAV-TONSPUREN-GUARD (30.08.): Die L-Cut-Tonspuren sollen die PCM-WAV
+    # spielen statt der GB-grossen mp4 (2 sinnlose Video-Decodes + Buffer-
+    # Starvation, gemessen 2.7% Medienzeit-Verlust + 90-160ms Naht-Loecher).
+    # Das geht NUR, wenn die WAV auf der Praesentationsachse liegt (migrierte
+    # Projekte: wav_dauer == audio_start + audio_dauer der Quelle). Unmigrierte
+    # Projekte (z.B. mod4v2, audio_start 0.137, WAV ab 0) bekaemen sonst
+    # einen 137ms-Achsenfehler -> die bleiben auf dem mp4-Pfad.
+    CFG["audio_aligned"] = False
+    try:
+        if os.path.exists(CFG["audio_path"]) and src_video and os.path.exists(src_video):
+            _wav_dur = float(subprocess.check_output(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", CFG["audio_path"]], text=True).strip())
+            _a_start, _a_dur = None, None
+            for _line in subprocess.check_output(
+                    ["ffprobe", "-v", "error", "-show_entries",
+                     "stream=codec_type,start_time,duration", "-of", "csv=p=0",
+                     src_video], text=True).strip().splitlines():
+                _p = _line.split(",")
+                if len(_p) >= 3 and _p[0] == "audio":
+                    try:
+                        _a_start, _a_dur = float(_p[1]), float(_p[2])
+                    except ValueError:
+                        pass
+            if _a_dur is not None:
+                CFG["audio_aligned"] = abs(_wav_dur - (_a_start + _a_dur)) < 0.10
+                print("[cockpit] Tonspur-Quelle: %s (wav %.3fs vs audio %.3f+%.3fs)"
+                      % ("audio48k.wav (praesentations-aligniert)" if CFG["audio_aligned"]
+                         else "source.mp4 (WAV nicht aligniert — Achsen-Guard)",
+                         _wav_dur, _a_start, _a_dur), flush=True)
+    except Exception as _e:  # noqa: BLE001
+        print("[cockpit] Tonspur-Alignment-Check fehlgeschlagen: %r" % (_e,), flush=True)
+
     for label, p in [
         ("workdir", workdir),
         ("segments", segments_path),
@@ -908,6 +1397,24 @@ def main():
     # scheitert der neue Bind mit "Address already in use" und der CUTTER-Tab
     # zeigt nur "cockpit.log pruefen". Mit Reuse bindet der Neustart sofort.
     ThreadingHTTPServer.allow_reuse_address = True
+    # MEDIA-LISTENER auf eigenem Port (14.08.): Chromium deckelt Verbindungen
+    # pro (Schema,Host,Port) auf 6. Haupt-Port traegt 4 Video-Elemente +
+    # B-Roll-Layer + permanenten Terminal-SSE-Stream = Budget voll; jeder
+    # Naht-Seek wartete in der Socket-Queue. Eigener Port = eigene Gruppe.
+    media_port = port + 2
+    try:
+        media_server = ThreadingHTTPServer(("127.0.0.1", media_port), Handler)
+        media_server.daemon_threads = True
+        threading.Thread(target=media_server.serve_forever,
+                         name="media-listener", daemon=True).start()
+        CFG["media_port"] = media_port
+        print("[cockpit] Media-Listener: http://127.0.0.1:%d/ (eigene Socket-Gruppe)"
+              % media_port, flush=True)
+    except OSError as e:
+        CFG["media_port"] = None
+        print("[cockpit] ⚠ Media-Port %d belegt (%s) — Media laeuft ueber den "
+              "Haupt-Port (6-Socket-Limit teilt sich mit SSE/API)." % (media_port, e),
+              flush=True)
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError as e:

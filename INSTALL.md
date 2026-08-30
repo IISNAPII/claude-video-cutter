@@ -18,11 +18,22 @@ python3.12 --version || py -3.12 --version || echo "PYTHON 3.12 FEHLT"
 - **macOS:** ffmpeg fehlt → `brew install ffmpeg` · Python 3.12 fehlt →
   `brew install python@3.12` oder via uv (immer nachfragen, bevor du
   installierst).
-- **Windows (Git Bash):** ffmpeg fehlt → `winget install ffmpeg` ·
-  Python 3.12 fehlt → `winget install Python.Python.3.12`. Danach neues
-  Terminal (PATH). Sag deinem User dazu: Der Cutter wurde auf macOS gebaut,
-  der Windows-Support ist frisch — bei Auffälligkeiten bitte in der
-  Community melden.
+- **Windows (10/11):** **Git für Windows ist Pflicht** (die Anleitung nutzt
+  bash-Kommandos; Claude Code selbst läuft nativ, nutzt für das Bash-Tool aber
+  die Git-Bash — findet Claude Code die bash.exe nicht, in `settings.json`
+  `"env": {"CLAUDE_CODE_GIT_BASH_PATH": "C:\\Program Files\\Git\\bin\\bash.exe"}`
+  setzen). ffmpeg fehlt → `winget install -e --id Gyan.FFmpeg`, danach NEUES
+  Terminal und `ffmpeg -version` als Pflicht-Verify (winget setzt bei
+  portablen Paketen den PATH manchmal falsch — dann das Zip von
+  https://www.gyan.dev/ffmpeg/builds/ nach `C:\ffmpeg` entpacken und
+  `C:\ffmpeg\bin` selbst in den PATH). Python 3.12 fehlt →
+  `winget install -e --id Python.Python.3.12` (KEIN Microsoft-Store-Python).
+  `Activate.ps1` wird von der Execution Policy geblockt — deshalb nie
+  aktivieren, immer direkt `.venv312/Scripts/python` aufrufen. Erwartung
+  ehrlich setzen: Final-Render läuft über libx264 statt Apple-Hardware und
+  dauert spürbar länger. Der Cutter wurde auf macOS gebaut, der
+  Windows-Support ist frisch — bei Auffälligkeiten bitte in der Community
+  melden.
 - **Linux:** ungetestet, ehrlich sagen und nur auf ausdrücklichen Wunsch
   fortfahren.
 

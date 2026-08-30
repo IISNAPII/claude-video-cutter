@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
 """V5 Phase 5: Render aus segments_v5.json (Solver-Ausgabe, gemessene Kanten).
 
-Unterschiede zu V4 cut.py:
-- Kanten kommen fertig vermessen aus solver_v5 (KEINE eigene Zeit-Logik hier)
-- Source-fps bleibt erhalten (V4 erzwang -r 30 auf 60fps-Material)
-- --mode proxy  : 1080p, libx264 veryfast (schnelle Review-Runde)
-- --mode final  : Source-Aufloesung, hevc_videotoolbox (Hardware, 4K60-tauglich)
+⚠️ UMGESTELLT AUF DEN SPLIT-PFAD (28.08.2026, V6-Vorfall)
+Der alte concat-Pfad hier schnitt mit den ROHEN in/out und liess bewusst die
+Source-fps stehen ("V4 erzwang -r 30 auf 60fps-Material"). Bei VFR-Quellen, die
+sich im Container als 60fps deklarieren (QuickTime-Fusionen!), erzeugte das:
+  - effektiv 29,956 statt 30,000 fps
+  - 25 fehlende Bilder (27357 statt 27382)
+  - PTS-Raster-Abweichung 1374 ms  -> verify_render FAIL
+Ein Player, der die deklarierte Rate statt der echten Zeitstempel nimmt, spielt
+Bild und Ton dann ueber 15 min um ~1,4 s versetzt ab. Genau das hat Sebastian
+an V6 gesehen ("Der Ton war KOMPLETT versetzt vom Video").
+
+Dieselbe Klasse Fehler war fuer rerender.py schon am 15.08. gefixt worden
+(Split-Pfad: apply_jcut_edges rastert die Bilddauern auf exakte 30fps-
+Vielfache, Bild/Ton als getrennte Ketten, ffconcat mit expliziten duration-
+Zeilen) — cut_v5.py wurde damals nur nicht nachgezogen. Jetzt nachgeholt:
+dieses Skript delegiert an denselben bewiesenen Pfad.
+Messung V6: PTS-Raster 0,00 ms PASS, A/V-Dauer 0,3 ms, Naht-Sync Median -7,4 ms.
+
+- --mode proxy  : 1080p, libx264 (schnelle Review-Runde)
+- --mode final  : Source-Aufloesung, hevc_videotoolbox
 
 Usage: cut_v5.py <src_video> <segments_v5.json> <out.mp4> [proxy|final]
 """
-import sys, os, json, subprocess, tempfile
+import sys, os, json, subprocess, tempfile, importlib.util
 
 BATCH = 25
 FADE_S = 0.012
@@ -20,9 +35,40 @@ def run(cmd):
         sys.stderr.write(r.stderr[-3000:]); raise SystemExit("ffmpeg failed")
     return r
 
+def _render_via_split(src, segs_path, out_mp4, mode):
+    """Delegiert an rerender.py::render_segments (Split-Pfad).
+
+    Ohne neuen Solver-Lauf: die Segmente kommen genau so, wie sie in
+    segments_v5*.json stehen — manuelle Kantenkorrekturen bleiben erhalten.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("rr", os.path.join(here, "rerender.py"))
+    rr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rr)
+
+    segs = [dict(s) for s in json.load(open(segs_path))["segments"] if s["out"] > s["in"]]
+    for s in segs:
+        s.setdefault("gain_db", 0.0)
+        s["jcut"] = 0.0
+    rr.apply_jcut_edges(segs)          # setzt v_in/v_out/v_start -> Split-Pfad aktiv
+    frames = sum(max(1, round((s["v_out"] - s["v_in"]) * rr.FPS)) for s in segs)
+    print(f"[cutv5] Split-Pfad: {len(segs)} Segmente, Soll {frames} Bilder "
+          f"= {frames / rr.FPS:.3f}s bei {rr.FPS:g} fps", flush=True)
+    workdir = os.path.dirname(os.path.abspath(segs_path))
+    rr.render_segments(segs, src, out_mp4, mode, [], workdir)
+    print(f"[cutv5] FERTIG -> {out_mp4}", flush=True)
+
 def main():
     src, segs_path, out_mp4 = sys.argv[1], sys.argv[2], sys.argv[3]
     mode = sys.argv[4] if len(sys.argv) > 4 else "proxy"
+
+    # Standardweg seit 28.08.2026: Split-Pfad (siehe Modulkopf). Der alte
+    # concat-Pfad darunter bleibt nur als Notausgang erreichbar.
+    if os.environ.get("CUTV5_LEGACY_CONCAT") != "1":
+        return _render_via_split(src, segs_path, out_mp4, mode)
+
+    print("[cutv5] WARNUNG: Legacy-concat-Pfad aktiv — erzeugt bei VFR-Quellen "
+          "ein kaputtes PTS-Raster (verify_render FAIL).", flush=True)
     S = json.load(open(segs_path))["segments"]
     segs = [(s["in"], s["out"]) for s in S]
 

@@ -16,11 +16,19 @@ nohup caffeinate -i .venv312/bin/python scripts/cut_v5.py "<VIDEO>" \
   work/<name>/segments_v5_repaired.json work/<name>/proxy.mp4 proxy \
   > work/<name>/render.log 2>&1 & disown
 ```
+Hinweis: `cut_v5.py` delegiert intern an `rerender.py::render_segments`
+(Split-Pfad, frame-gerastert) — der alte concat-Pfad erzeugte >1s PTS-Drift.
+Legacy nur über `CUTV5_LEGACY_CONCAT=1` — NIE benutzen.
+
 Überwachen bis `FERTIG` im Log. Danach PFLICHT-Verifikation:
 ```bash
 ffprobe -v error -show_entries stream=codec_type,duration -of csv=p=0 work/<name>/proxy.mp4
 ```
-- [ ] Video- und Audio-Dauer differieren <100ms (A/V-Sync-Beweis)
+- [ ] Video- und Audio-Dauer differieren <100ms (nötig, aber KEIN Sync-Beweis!)
+- [ ] **Packet-PTS-Raster über ALLE Pakete**: max |pts_i − i/30| < 1 ms UND
+  Framezahl == Soll (Schnittlänge × 30). Bei Abweichung: STOPP und Ursache
+  finden, nicht wegerklären — ein Player spielt nach PTS; eine intern
+  konsistente Datei kann trotzdem falsch abspielen.
 - [ ] 3 Hör-Stichproben: je 6s an zufälligen Stellen extrahieren, mit
   faster-whisper (small) transkribieren — Text muss flüssig lesen, keine
   Wortfragmente, kein Fremd-Content:
@@ -41,18 +49,20 @@ Atmer-Warnungen, Feinschliff-Kandidaten, komprimierte Stille >20s.
 
 ## D3: Cut-Cockpit starten (die Schnitt-Software)
 
-**D3a — Cockpit-Manifest schreiben (Pflicht, VOR dem Server-Start):**
-Schreibe `work/<name>/cockpit.json`, damit das Agentic OS (CUTTER-Tab) das
-Cockpit später per Klick ohne Nachfragen neu starten kann (der src-Video-Pfad
-ist sonst nirgends persistiert):
-```json
-{
-  "src_video": "<VOLLER PFAD ZUM ORIGINAL-VIDEO>",
-  "segments": "segments_v5_repaired.json",
-  "qa": "verify2/qa_stage_a.json",
-  "port": 8766
-}
+**D3a — PFLICHT: `cockpit_setup.py` laufen lassen (ersetzt jede Handarbeit):**
+```bash
+.venv312/bin/python scripts/cockpit_setup.py work/<name>
 ```
+(Windows: `.venv312/Scripts/python`.) Das Skript richtet das Workdir komplett
+ein, ist idempotent und rührt `cockpit_overrides.json` (= die Schnitte deines
+Users) NIE an: `broll_sync.json` (Quelle, Offset, `pip.transition.dur=0.45`,
+`render_size` 1920x1080, `mirror_sources=false` sobald Screen-Slots
+existieren), Prüfung der Screen-/Grafik-Slots, `cockpit.json` (damit das
+Agentic OS das Cockpit per Klick neu starten kann), Quellenschutz per
+Hardlink, Werkzeug-Erreichbarkeit, Slot-Überlappungen. Exit-Code 2 = Befunde
+offen → erst beheben, dann übergeben. Mit `--check-only` nur prüfen — und bei
+FERTIG GERENDERTEN Projekten ausschließlich `--check-only` (eine geänderte
+Transition würde einen abgenommenen Render verändern).
 
 Verwende `qa_stage_a.json` als QA-Argument, wenn Repair 0 Kanten geändert hat
 (dann existiert kein verify2/ — Diff prüfen). Das Plugin akzeptiert beide.
@@ -62,6 +72,7 @@ nohup .venv312/bin/python scripts/cockpit_server.py work/<name> \
   work/<name>/segments_v5_repaired.json work/<name>/qa_stage_a.json \
   8766 "<VIDEO>" > work/<name>/cockpit.log 2>&1 & disown
 until curl -s -o /dev/null http://127.0.0.1:8766/api/state; do sleep 1; done
+head -1 work/<name>/cockpit.log      # muss "Werkzeuge ok: ffprobe=..., ffmpeg=..." zeigen
 ```
 Das 6. Argument (Quell-Video) ist PFLICHT — ohne läuft der Player nicht auf dem
 Original (EDL-Playback), der Re-Render-Button und die B-Roll-Composite-Preview
@@ -138,4 +149,4 @@ B-Roll-ERSTELLUNG ist NICHT dein Job → `broll-ersteller`-Agent / Skill `video-
   Git Bash normal
 - Port prüfen/freimachen: statt `lsof -ti :8766` →
   `netstat -ano | findstr :8766`, dann `taskkill //PID <pid> //F`
-- ffmpeg installieren: `winget install ffmpeg` · Python 3.12: `winget install Python.Python.3.12`
+- ffmpeg installieren: `winget install -e --id Gyan.FFmpeg` · Python 3.12: `winget install Python.Python.3.12`
