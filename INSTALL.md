@@ -17,7 +17,9 @@ python3.12 --version || py -3.12 --version || echo "PYTHON 3.12 FEHLT"
 
 - **macOS:** ffmpeg fehlt → `brew install ffmpeg` · Python 3.12 fehlt →
   `brew install python@3.12` oder via uv (immer nachfragen, bevor du
-  installierst).
+  installierst). **Optional, aber empfohlen:** `brew install tmux` — damit
+  überlebt die Claude-Session im Cockpit einen Projektwechsel und baut z.B.
+  B-Roll im Hintergrund fertig (ohne tmux läuft alles klassisch weiter).
 - **Windows (10/11):** **Git für Windows ist Pflicht** (die Anleitung nutzt
   bash-Kommandos; Claude Code selbst läuft nativ, nutzt für das Bash-Tool aber
   die Git-Bash — findet Claude Code die bash.exe nicht, in `settings.json`

@@ -427,7 +427,11 @@ def main():
     # Stattdessen: Pass 1 rendert PRO RUN eine fertige Spur (sequenziell,
     # kleiner Graph), Pass 2 legt nur noch die fertigen Run-Videos aufs Base.
     # saas7 (57 Stuecke) bleibt unter der Schwelle -> alter Pfad unveraendert.
-    TWO_PASS_THRESHOLD = 80
+    # 31.08.2026: Schwelle 80 -> 40. mod4v7 (65 Stuecke, 2.9GB-Quelle) und
+    # mod4v6 (70 Stuecke) starben im Single-Pass-Composite reproduzierbar mit
+    # rc=-9 (OOM, auch solo bei 66GB freier Disk) — der Two-Pass-Pfad ist fuer
+    # genau diese Klasse gebaut (yt1b: 184 Stuecke fehlerfrei).
+    TWO_PASS_THRESHOLD = 40
     run_files = None
     if len(pieces) > TWO_PASS_THRESHOLD:
         print(f"[sync] {len(pieces)} Stuecke > {TWO_PASS_THRESHOLD} -> Two-Pass "

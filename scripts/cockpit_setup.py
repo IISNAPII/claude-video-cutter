@@ -216,6 +216,78 @@ def main():
     sag(OK if src and os.path.exists(src) else FAIL,
         f"cockpit.json: src={os.path.basename(src or '?')} segments={seg} qa={qa}")
 
+    # --- 11: Pausen-Karte (Echo-Clamp-Grundlage, 01.09.) --------------------
+    # Ohne Karte klemmt weder Player noch Renderer die L-Cuts an die
+    # gemessene Stille -> Echo-/Kapp-Risiko an Split-Naehten.
+    pm_pfad = os.path.join(wd, "pause_map.json")
+    wav16 = os.path.join(wd, "audio16k.wav")
+    if os.path.exists(pm_pfad):
+        sag(OK, "pause_map.json vorhanden (L-Cut-Echo-Clamp aktiv)")
+    elif os.path.exists(wav16):
+        if check_only:
+            sag(WARN, "pause_map.json fehlt — wuerde jetzt aus audio16k.wav gemessen")
+        else:
+            try:
+                subprocess.run(
+                    [sys.executable,
+                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "pause_map.py"),
+                     wd], check=True, timeout=900)
+                sag(OK, "pause_map.json gemessen (Waveform-Pausen)")
+            except Exception as e:  # noqa: BLE001
+                sag(WARN, f"pause_map.py fehlgeschlagen: {e!r}")
+    else:
+        sag(WARN, "audio16k.wav fehlt — Pausen-Karte nicht messbar, L-Cuts werden "
+                  "NICHT an die Stille geklemmt")
+
+    # --- 12: Playback-Proxy (fluessiges Naht-Playback) ----------------------
+    if os.path.exists(os.path.join(wd, "edit_intra_main.mp4")):
+        sag(OK, "edit_intra_main.mp4 vorhanden (Naht-Seeks ~1 Frame)")
+    else:
+        sag(WARN, "edit_intra_main.mp4 FEHLT — Wiedergabe ruckelt an jeder Naht. "
+                  "Bauen (15-60 Min, im Hintergrund): "
+                  "python scripts/build_playback_proxy.py " + os.path.basename(wd))
+
+    # --- 13: Status-Hooks der persistenten Agent-Session --------------------
+    # (tmux-Sessions ueberleben Projektwechsel; die Hooks machen den Status
+    #  "arbeitet/fertig" im Cockpit-Badge sichtbar. Nur POSIX — unter Windows
+    #  laeuft das Terminal im klassischen Modus ohne Persistenz.)
+    if os.name != "nt":
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _spfad = os.path.join(_root, ".claude", "settings.json")
+        try:
+            _s = lade(_spfad, {}) or {}
+            _hk = _s.setdefault("hooks", {})
+            _cmd = "\"$CLAUDE_PROJECT_DIR\"/scripts/cutter_session_hook.py"
+            def _hat_hook(_lst):
+                # NICHT ueber json.dumps vergleichen — das escapt die Quotes
+                # im Kommando und der Substring matcht nie (haette die Hooks
+                # bei jedem Lauf dupliziert; im Test gefunden).
+                for _e in _lst:
+                    for _h in (_e.get("hooks") or []):
+                        if "cutter_session_hook" in str(_h.get("command", "")):
+                            return True
+                return False
+            _neu = []
+            for _ev in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"):
+                _lst = _hk.setdefault(_ev, [])
+                if not _hat_hook(_lst):
+                    _lst.append({"hooks": [{"type": "command", "command": _cmd}]})
+                    _neu.append(_ev)
+            if _neu and not check_only:
+                os.makedirs(os.path.dirname(_spfad), exist_ok=True)
+                schreibe_atomar(_spfad, _s)
+                sag(OK, "Agent-Status-Hooks registriert (%s) — greifen ab der "
+                        "naechsten Claude-Session" % ", ".join(_neu))
+            elif _neu:
+                sag(WARN, "Agent-Status-Hooks fehlen (%s) — wuerden registriert" % ", ".join(_neu))
+            else:
+                sag(OK, "Agent-Status-Hooks registriert (Session-Status im Badge)")
+        except Exception as e:  # noqa: BLE001
+            sag(WARN, f"Hook-Registrierung uebersprungen: {e!r}")
+    else:
+        sag(WARN, "Windows: persistente Agent-Sessions (tmux) nicht verfuegbar — "
+                  "Terminal laeuft klassisch, Auftraege enden mit dem Cockpit")
+
     # --- schreiben ----------------------------------------------------------
     if aenderungen and not check_only:
         b1 = sichern(bs_pfad); b2 = sichern(ck_pfad)

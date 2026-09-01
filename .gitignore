@@ -22,3 +22,6 @@ work/
 .DS_Store
 *.log
 nohup.out
+
+# Lokal generierte Claude-Projekt-Settings (schreibt cockpit_setup.py)
+.claude/

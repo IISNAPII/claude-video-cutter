@@ -115,6 +115,27 @@ und rechts sprichst du direkt mit deinem Cutting-Agenten.
 Rechne bei einem 60-Minuten-Video mit einer guten Stunde Laufzeit
 (Transkription + Analyse + QA), die größtenteils unbeaufsichtigt läuft.
 
+## Was ist neu (September 2026)
+
+- **L-Cuts ohne Echo und ohne Stottern:** Eine waveform-gemessene
+  Pausen-Karte (`pause_map.json`, entsteht automatisch) klemmt jeden L-Cut
+  auf die echte Stille an der Naht — Player und Renderer rechnen dabei
+  garantiert identisch (Cross-Test `scripts/test_echo_clamp.py`).
+- **Flüssiges Playback:** All-Intra-Playback-Proxys per portablem
+  `scripts/build_playback_proxy.py` (inkl. Startzeiten-Erhalt); fehlt etwas,
+  sagt es dir jetzt ein Banner direkt im Cockpit statt still im Server-Log.
+- **Persistente Agent-Sessions** (macOS/Linux, braucht `tmux`): Die
+  Claude-Session im Cockpit läuft pro Projekt in einer tmux-Session weiter,
+  auch wenn du das Projekt wechselst — ein B-Roll-Auftrag baut im
+  Hintergrund fertig, ein Badge im Header zeigt, wer gerade arbeitet, und
+  beim Zurückwechseln ist dieselbe Session wieder offen. Nach einem Reboot
+  wird der Gesprächskontext per `--resume` wiederhergestellt.
+- **B-Roll-Aufträge treffsicher:** Das T-Marker-Briefing rechnet die
+  Zeitachse jetzt inklusive L-Cuts (vorher konnte es bei vielen L-Cuts um
+  Sekunden danebengreifen).
+- `cockpit_setup.py` prüft/erzeugt das alles automatisch pro Video
+  (Pausen-Karte, Proxy-Hinweis, Status-Hooks).
+
 ## Was drin ist
 
 ```

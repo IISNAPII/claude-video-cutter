@@ -69,6 +69,8 @@
   .inspector { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
   .side-tabs { display: flex; gap: 4px; margin: 0 0 8px; flex: 0 0 auto; }
   .side-tab { flex: 1; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; padding: 5px 0; border-radius: 6px; cursor: pointer; }
+  .side-tab.mini { flex: 0 0 auto; padding: 5px 9px; }
+  .side-tab.mini:hover { color: var(--warn); border-color: var(--warn); }
   .side-tab.active { color: var(--text); border-color: var(--border-strong); background: var(--panel-3); }
   .side-tab .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-left: 5px; vertical-align: middle; }
   .claude-pane { position: relative; flex: 1; min-height: 0; background: #0a0a0d; border-radius: 6px; overflow: hidden; }
@@ -122,6 +124,9 @@
     background: rgba(140,190,255,.35); cursor: ew-resize; z-index: 4; }
   .clip.vclip:hover::before { background: var(--accent); }
   .clip.vclip.haslcut::before { background: #f97316; width: 3px; }
+  /* Echo-Clamp aktiv: Wunsch-jcut > effektiv moeglich (keine Stille an der Naht) */
+  .clip.vclip.haslcut.silclamped::before { background: #eab308; }
+  .clip.vclip.haslcut.silclamped::after { color: #eab308; }
   .clip.vclip.clamped::before { background: #eab308; width: 3px; }
   .clip.vclip.seamdrag::before { background: var(--accent); width: 3px; }
   /* Wert am Griff, ohne eigenes DOM-Element */
@@ -271,6 +276,8 @@
     <h1>Cut-Cockpit</h1>
     <span class="stat" id="statSummary">lädt …</span>
     <span class="spacer"></span>
+    <span class="save-state" id="agentBadge" role="status" aria-live="polite"
+          title="Persistente Agent-Sessions: laufen in tmux weiter, auch wenn du das Projekt wechselst"></span>
     <span class="save-state" id="renderState" role="status" aria-live="polite"></span>
     <span class="save-state" id="saveState" role="status" aria-live="polite">bereit</span>
     <button id="btnDrawer" class="ghost" aria-label="Text-Ansicht öffnen oder schließen" aria-expanded="false">Text-Ansicht</button>
@@ -312,6 +319,8 @@
       <div class="side-tabs">
         <button class="side-tab active" id="tabClaude" type="button">Claude</button>
         <button class="side-tab" id="tabInspector" type="button">Inspector<span class="dot" id="inspDot" style="display:none"></span></button>
+        <button class="side-tab mini" id="btnKillSession" type="button"
+                title="Agent-Session dieses Projekts BEENDEN (tmux + Claude). Normalerweise nicht nötig — die Session überlebt Projektwechsel absichtlich und arbeitet im Hintergrund weiter.">✕</button>
       </div>
       <div class="claude-pane" id="claudePane">
         <div id="claudeTermHost"></div>
@@ -522,9 +531,55 @@
   // Preis: die Toene ueberlappen sich um jcut(i), und die Timeline wird um
   // Σ jcut kuerzer. Beides ist die zwangslaeufige Folge davon, dass der Ton
   // nach links rutscht.
-  var LCUT_DEFAULT = 0.25;   // Sekunden
+  var LCUT_DEFAULT = 0.25;   // Sekunden (Obergrenze — die Stille klemmt real)
   var LCUT_MIN_VDUR = 0.20;  // ein Bildclip darf nie kuerzer werden
   var LCUT_EPS = 0.001;
+  var LCUT_MIN_USEFUL = 0.04;   // unter 40ms bringt ein Vorlauf nichts — dann lieber keiner
+  var LCUT_SIL_MARGIN = 0.02;   // Sicherheitsabstand zur gemessenen Sprach-Kante
+
+  // ---------- Pausen-Karte (01.09.) ----------
+  // Waveform-gemessene Sprechpausen (pause_map.py, Server: state.pauseMap).
+  // DER Kern des L-Cut-Fixes. Im Ueberlapp-Fenster spielen ZWEI Quellen
+  // gleichzeitig: der A-Schwanz [out−j, out] und der B-Kopf [in, in+j].
+  // Doppel-Sprache ("Echo", 30.08.) entsteht NUR, wenn sich A-Sprache und
+  // B-Sprache im Fenster zeitlich treffen. Sauber ist das Fenster genau dann,
+  // wenn  j <= tailSilence(A.out) + headSilence(B.in)  — an normalen Naehten
+  // deckt Bs Einatem-/Anlauf-Stille den A-Schwanz ab (L-Cut bleibt voll), an
+  // Split-Naehten (Sprache klebt beidseitig) geht j gegen 0 (Echo unmoeglich).
+  // Verifiziert an yt1b: 86/95 L-Cuts bleiben, die 9 geklemmten sind die
+  // Echo-Naehte. NIE auf ASR-Wortzeiten stuetzen (Gesetz pausen_immer_messen).
+  var pausesFile = null;   // sortierte [start,ende]-Paare auf der FILE-Achse
+  function initPauseMap(pm){
+    if(!pm || !pm.pauses || !pm.pauses.length){ pausesFile=null; return; }
+    var off = (pm.aligned===false && typeof pm.audio_start==="number") ? pm.audio_start : 0;
+    pausesFile = pm.pauses.map(function(p){ return [p[0]+off, p[1]+off]; });
+    pausesFile.sort(function(a,b){ return a[0]-b[0]; });
+  }
+  function _pauseIdxBefore(t){
+    var lo=0, hi=pausesFile.length-1, best=-1;
+    while(lo<=hi){ var m=(lo+hi)>>1;
+      if(pausesFile[m][0] <= t){ best=m; lo=m+1; } else { hi=m-1; } }
+    return best;
+  }
+  // Wieviel gemessene Stille liegt DIREKT vor Quellzeit t? (0 = t steckt in Sprache)
+  function tailSilenceAt(t){
+    if(!pausesFile) return Infinity;   // keine Karte -> kein Limit (Banner warnt)
+    var i=_pauseIdxBefore(t);
+    if(i<0) return 0;
+    var p=pausesFile[i];
+    if(t > p[1] + 0.03) return 0;      // kleiner Schlupf: Kante knapp hinter der Pause
+    return Math.max(0, Math.min(t, p[1]) - p[0]);
+  }
+  // Wieviel gemessene Stille liegt DIREKT nach Quellzeit t?
+  function headSilenceAt(t){
+    if(!pausesFile) return Infinity;
+    var i=_pauseIdxBefore(t);
+    if(i>=0){ var p=pausesFile[i];
+      if(t <= p[1] + 0.001) return Math.max(0, p[1] - Math.max(t, p[0])); }
+    var nx=pausesFile[i+1];
+    if(nx && nx[0]-t <= 0.03) return nx[1]-nx[0];   // Pause beginnt hauchduenn danach
+    return 0;
+  }
 
   function jcutOf(i){ var c=clips[i]; return (i<=0||!c) ? 0 : Math.max(0,+(c.jcut||0)); }
   // Wie weit darf der Ton von Clip i maximal nach links?
@@ -541,7 +596,21 @@
     var nextRoom = durCur - jcutOf(i+1) - 0.05;
     return Math.max(0, Math.min(ownRoom, prevRoom, nextRoom));
   }
-  // Erzwingt alle Grenzen. Gibt die Anzahl geklemmter Naehte zurueck.
+  // EFFEKTIVER jcut (01.09., NICHT-DESTRUKTIV): der gespeicherte c.jcut ist
+  // der WUNSCH und bleibt unangetastet. Wirksam wird das Minimum aus Wunsch
+  // und dem Echo-freien Fenster (tail+head-Stille, s.o.). Verbessert sich die
+  // Datenlage (Kante in Stille getrimmt, Achsen-Migration), waechst der
+  // effektive Wert von selbst wieder Richtung Wunsch — nichts geht verloren.
+  function jcutEffOf(i){
+    var j = jcutOf(i);
+    if(j<=LCUT_EPS || !pausesFile || !clips[i-1]) return j;
+    var room = tailSilenceAt(clips[i-1].outS) + headSilenceAt(clips[i].inS) - LCUT_SIL_MARGIN;
+    var eff = Math.min(j, Math.max(0, room));
+    if(eff < LCUT_MIN_USEFUL) eff = 0;   // Mini-Vorlaeufe bringen nichts
+    return +eff.toFixed(4);
+  }
+  // Erzwingt die STRUKTUR-Grenzen (Geometrie der Nachbarn) am gespeicherten
+  // Wert. Gibt die Anzahl geklemmter Naehte zurueck.
   function clampJcuts(){
     var clamped=0;
     if(clips.length) clips[0].jcut=0;
@@ -554,14 +623,15 @@
     }
     return clamped;
   }
-  function anyLcut(){ return clips.some(function(c,i){ return i>0 && (+c.jcut||0)>LCUT_EPS; }); }
+  function anyLcut(){ return clips.some(function(c,i){ return i>0 && (+(c.jcutEff!=null?c.jcutEff:c.jcut)||0)>LCUT_EPS; }); }
 
   function recomputeOffsets(){
     clampJcuts();
     var aEndPrev=0;
     clips.forEach(function(c,i){
       c.dur=Math.max(0,c.outS-c.inS);
-      var j=jcutOf(i);
+      var j=jcutEffOf(i);               // EFFEKTIV (Echo-frei geklemmt), Wunsch bleibt in c.jcut
+      c.jcutEff=j;
       c.pStart = aEndPrev - j;          // Ton-Start (bleibt der Timeline-Anker)
       c.vStart = aEndPrev;              // Bild-Start = lueckenlos am Vorgaenger
       c.vEnd   = c.pStart + c.dur;      // Bild endet mit dem Ton
@@ -816,9 +886,13 @@
         frag.appendChild(el);
       }
       var on=(i>0)&&((+c.jcut||0)>LCUT_EPS);
+      var eff=(c.jcutEff!=null)?+c.jcutEff:+(c.jcut||0);
+      // Anzeige = EFFEKTIVER Wert; "silclamped" wenn der Echo-Clamp den
+      // Wunsch begrenzt hat (Naht ohne ausreichende Stille, z.B. Split).
       el.className="clip vclip"+(i%2?" alt":"")+(selectedIds.has(c.id)?" selected":"")
-        +(on?" haslcut":"")+(c.jcutClamped?" clamped":"");
-      el.setAttribute("data-lcut", on?Math.round(c.jcut*1000):"");
+        +(on?" haslcut":"")+(c.jcutClamped?" clamped":"")
+        +((on && (+c.jcut - eff) > LCUT_EPS)?" silclamped":"");
+      el.setAttribute("data-lcut", on?Math.round(eff*1000):"");
     });
     trackVid.appendChild(frag);
     // Nicht mehr sichtbare Clips entfernen
@@ -1135,20 +1209,41 @@
   var vorlaufEl = document.getElementById("audioTrack");   // audioTrack2 bleibt ungenutzt
   var srcMediaUrl = null;     // in init() gesetzt (WAV wenn aligniert — sample-genaue Seeks)
   var vlArmedFor = null;      // Clip-ID (oder id+"#late") des vorbereiteten Fensters
-  var vlWin = null;           // {id, endT} des gerade HOERBAR spielenden Fensters
-  var vlStat = { fenster:0, gespielt:0, spaetstart:0 };
-  window.vlDiag = function(){ return { fenster_vorbereitet: vlStat.fenster,
-    gespielt: vlStat.gespielt, spaetstarts: vlStat.spaetstart,
-    armiert: vlArmedFor, aktiv: !!vlWin }; };
+  var vlWin = null;           // {id, endT, endPos, snapped} des hoerbaren Fensters
+  var vlStat = { fenster:0, gespielt:0, spaetstart:0, snaps:0, lagen:[] };
+  // LAGE-BEWEIS (01.09.): vlDiag zaehlt nicht mehr nur, OB Fenster spielten,
+  // sondern misst, WIE GENAU sie lagen (Sprungweite am Fensterende in ms).
+  // Der 30.08.-Verify war ein reiner Zaehl-Beweis — die Fehllage blieb unsichtbar.
+  window.vlDiag = function(){
+    var l=vlStat.lagen.slice().sort(function(a,b){return Math.abs(a)-Math.abs(b);});
+    return { fenster_vorbereitet: vlStat.fenster,
+      gespielt: vlStat.gespielt, spaetstarts: vlStat.spaetstart,
+      snaps: vlStat.snaps,
+      lage_ms: l.length ? { n:l.length, median:l[l.length>>1],
+        schlechteste:l[l.length-1] } : null,
+      armiert: vlArmedFor, aktiv: !!vlWin }; };
   // Kompatibilitaets-Stub (Test-Werkzeuge riefen atDiag):
   window.atDiag = function(){ return { tonspurModus: false,
     hinweis: "Ton laeuft immer im Hauptvideo (20260814f)", vorlauf: window.vlDiag() }; };
   function vorlaufDisarm(){
+    // Lage am Fensterende messen (nur bei regulaerem Ende, nicht bei Seeks):
+    // Sollposition = inS + jcut (vlWin.endPos). Abweichung = hoerbare
+    // Sprungweite beim Uebergang auf das Hauptvideo.
+    if(vlWin && vlWin.endPos != null && !vorlaufEl.paused){
+      try{
+        var _t = curProxyTime();
+        if(Math.abs(_t - vlWin.endT) < 0.12){
+          var lage = Math.round(((vorlaufEl.currentTime||0) - vlWin.endPos)*1000);
+          if(Math.abs(lage) < 2000){ vlStat.lagen.push(lage);
+            if(vlStat.lagen.length>60) vlStat.lagen.shift(); }
+        }
+      }catch(e){}
+    }
     vlArmedFor = null; vlWin = null;
     try{ vorlaufEl.volume = 0; if(!vorlaufEl.paused) vorlaufEl.pause(); }catch(e){}
-    // ROLL-SEMANTIK (30.08., Sebastians Befund "hoert sich doppelt an"):
-    // waehrend des Fensters ist das Hauptvideo stumm (A-Tail unhoerbar),
-    // hier IMMER wieder hoerbar machen — egal wie das Fenster endet.
+    // Seit 01.09. wird das Hauptvideo im Fenster NICHT mehr gemutet (der
+    // Silence-Clamp macht den A-Schwanz garantiert still). Das unmute bleibt
+    // als Aufraeum-Sicherheit fuer jeden Ausgangspfad stehen.
     try{ video.muted = false; }catch(e){}
   }
   // Naechster J-Cut-Clip, dessen Fenster [pStart, vStart] laeuft oder bevorsteht
@@ -1156,7 +1251,7 @@
     var best = null;
     for(var i=1;i<clips.length;i++){
       var c=clips[i];
-      if((+c.jcut||0) <= LCUT_EPS) continue;
+      if((+(c.jcutEff!=null?c.jcutEff:c.jcut)||0) <= LCUT_EPS) continue;   // EFFEKTIVER Wert (Echo-Clamp)
       if(c.vStart < t - 0.05) continue;          // Fenster schon vorbei
       if(!best || c.pStart < best.pStart) best = c;
     }
@@ -1181,7 +1276,12 @@
         if(!vorlaufEl.src && srcMediaUrl){ vorlaufEl.src = srcMediaUrl; }
         vorlaufEl.muted = false; vorlaufEl.volume = 0;
         if(!vorlaufEl.paused) vorlaufEl.pause();
-        vorlaufEl.currentTime = Math.max(0, c.inS - 0.20);  // kleiner stummer Anlauf-Puffer
+        // Anlauf-Puffer RATE-SKALIERT (01.09.): der Play-Trigger feuert ~0,30s
+        // WANDUHR vor dem Fenster, das Element verbraucht dabei 0,30*rate
+        // MEDIENsekunden. Der alte feste 0,20-Puffer passte dazu bei keiner
+        // einzigen Rate — die Lage hing an der zufaelligen play()-Anlaufzeit.
+        // Exakt hingelegt wird ohnehin per Snap am Fensteranfang.
+        vorlaufEl.currentTime = Math.max(0, c.inS - (0.30*rate + 0.10));
         vlArmedFor = c.id; vlStat.fenster++;
       }catch(e){}
     }
@@ -1194,18 +1294,33 @@
         vorlaufEl.play().catch(function(){});
       }catch(e){}
     }
-    // IM FENSTER: hoerbar machen; grobe Fehllage EINMALIG korrigieren.
-    // ROLL-SEMANTIK: das Hauptvideo (A-Tail) ist im Fenster STUMM — der Ton
-    // wechselt hart von A auf B (kein Doppel-Ton mehr; bei Splits klingt es
-    // wie ununterbrochenes Sprechen). Bild rollt wie gehabt bei vStart.
+    // IM FENSTER (Ueberlapp-Semantik seit 01.09.): der Vorlauf-Schnipsel
+    // (B-Anfang) laeuft HOERBAR ueber dem A-Schwanz des Hauptvideos. Das
+    // Hauptvideo wird NICHT mehr gemutet — der Silence-Clamp (jcutMax d)
+    // garantiert, dass der A-Schwanz im Fenster Stille ist. Der Doppelton
+    // vom 30.08. entstand durch jcut > gemessene Stille und ist damit
+    // konstruktiv unmoeglich; faellt der Schnipsel aus, fehlt nur der
+    // Vorlauf — der Grundton bleibt IMMER intakt (Garantie gilt wieder).
     if(inFenster){
       if(vlArmedFor === c.id){
         var soll = c.inS + (t - c.pStart);
         if(vorlaufEl.paused){ try{ vorlaufEl.playbackRate=rate; vorlaufEl.play().catch(function(){}); }catch(e){} }
-        if(Math.abs((vorlaufEl.currentTime||0) - soll) > 0.30){ try{ vorlaufEl.currentTime = soll; }catch(e){} }
-        if(!vlWin){ vlWin = { id:c.id, endT:c.vStart }; vlStat.gespielt++; }
-        vorlaufEl.volume = 1;
-        try{ video.muted = true; }catch(e){}
+        if(!vlWin){ vlWin = { id:c.id, endT:c.vStart, endPos:c.inS+(c.vStart-c.pStart), snapped:false }; vlStat.gespielt++; }
+        // LAGE-SNAP (01.09.): EINMAL am Fensteranfang exakt hinlegen, Ton erst
+        // danach freigeben. Vorher war die Korrektur-Toleranz 0,30s — GROESSER
+        // als das ganze Fenster (typ. 0,25s), sie konnte per Konstruktion nie
+        // greifen; die Lage hing an der ungemessenen play()-Anlaufzeit und
+        // sprang von Naht zu Naht (der hoerbare "Stotterer"). WAV-Seeks sind
+        // sample-genau -> ein Snap, kein Seek-Sturm.
+        var errL = (vorlaufEl.currentTime||0) - soll;
+        if(!vlWin.snapped && Math.abs(errL) > 0.06){
+          try{ vorlaufEl.currentTime = soll; vlStat.snaps++; }catch(e){}
+          vlWin.snapped = true;              // Ton kommt im naechsten Tick
+        } else {
+          vlWin.snapped = true;
+          if(Math.abs(errL) > 0.35){ try{ vorlaufEl.currentTime = soll; }catch(e){} }  // Entgleisungs-Notbremse
+          vorlaufEl.volume = 1;
+        }
       } else if(vlArmedFor !== c.id + "#late"){
         // Seek direkt ins Fenster (Trim-Vorschau!): EIN Sofort-Start —
         // WAV-Seeks sind sample-genau und quasi sofort. Kein Wiederholen.
@@ -1217,8 +1332,7 @@
           vorlaufEl.playbackRate = rate;
           vorlaufEl.volume = 1;
           vorlaufEl.play().catch(function(){});
-          vlWin = { id:c.id, endT:c.vStart }; vlStat.spaetstart++;
-          try{ video.muted = true; }catch(err){}
+          vlWin = { id:c.id, endT:c.vStart, endPos:c.inS+(c.vStart-c.pStart), snapped:true }; vlStat.spaetstart++;
         }catch(e){}
       }
     }
@@ -1238,7 +1352,6 @@
     // und dekodiert -> nahtloser Uebergang statt Seek-Stall an jeder Naht.
     var old=video; video=videoSb; videoSb=old;
     video.classList.add("active"); videoSb.classList.remove("active");
-    // Bei aktivem L-Cut kommt der Ton aus den Tonspuren -> Bildpuffer bleiben stumm
     video.muted=false; videoSb.muted=true;   // Ton kommt IMMER aus dem Hauptvideo (20260814f)
     vorlaufDisarm();   // Bildnaht = Fensterende: Schnipsel exakt hier stoppen (Roll-Semantik, kein Doppel-Ton)
     applyRate();                 // getauschter Puffer uebernimmt das Review-Tempo
@@ -1290,7 +1403,11 @@
     // Noch mitten im Clip -> ggf. Standby fuer die naechste ECHTE Naht laden
     if(s < c.vOut - EDL_EPS){
       var nx = clips[curClipIdx+1];
-      if(nx && !video.paused && sbPreparedFor!==nx.id && (c.vOut - s) < 2.5
+      // Vorlauf RATE-SKALIERT (01.09.): 2,5 waren MEDIENsekunden — bei 3x
+      // blieben nur 0,83s Wanduhr zum Vorbereiten des Standby-Seeks. Genau
+      // im Review-Tempo (2x/3x) brach der Puffer zuerst weg -> Naht-Ruckler.
+      if(nx && !video.paused && sbPreparedFor!==nx.id
+         && (c.vOut - s) < 2.5*Math.max(1, reviewRate||1)
          && Math.abs(nx.vIn - c.vOut) > EDL_GAP_MIN){
         try{ videoSb.currentTime = nx.vIn; sbPreparedFor = nx.id; }catch(e){}
       }
@@ -2889,6 +3006,44 @@
     window.addEventListener("resize", positionClips);
   }
 
+  // ---------- Persistente Agent-Sessions: Badge + Poll (01.09.) ----------
+  // Sessions laufen in tmux weiter, wenn das Projekt gewechselt wird — das
+  // Badge zeigt den Status der EIGENEN Session und wer sonst noch im
+  // Hintergrund arbeitet ("von Video zu Video erkannt").
+  function renderAgentSessions(list){
+    var el=document.getElementById("agentBadge"); if(!el) return;
+    list=list||[];
+    var cur=null, andere=[];
+    list.forEach(function(s){ if(s.aktuell) cur=s; else andere.push(s); });
+    var txt="", cls="save-state";
+    if(cur){
+      var m={arbeitet:"🟠 Agent arbeitet", fertig:"🟢 Agent fertig",
+             bereit:"🤖 Agent bereit", beendet:"⚪ Agent beendet"};
+      txt=m[cur.status]||"🤖 Agent läuft";
+      if(cur.status==="arbeitet") cls+=" saving";
+      else if(cur.status==="fertig") cls+=" saved";
+      var tip="Session "+(cur.session||"")+(cur.ts?" · "+cur.ts:"");
+      if(cur.aufgabe) tip+="\nZuletzt: "+cur.aufgabe;
+      el.title=tip;
+    }
+    var busy=andere.filter(function(s){ return s.status==="arbeitet"; });
+    if(busy.length){
+      txt+=(txt?" · ":"")+busy.map(function(s){ return "🟠 "+s.projekt; }).join(" ")+" im Hintergrund";
+      if(!cur) cls+=" saving";
+    } else if(!cur && andere.length){
+      txt="🤖 "+andere.length+" Session(s) im Hintergrund";
+    }
+    el.textContent=txt;               // leer -> per CSS :empty unsichtbar
+    el.className=cls;
+  }
+  function pollAgentStatus(){
+    // Alter Server (vor 01.09.) kennt den Endpoint nicht -> still ignorieren.
+    fetch("/api/agent_status").then(function(r){ if(!r.ok) throw 0; return r.json(); })
+      .then(function(d){ renderAgentSessions(d.sessions||[]); })
+      .catch(function(){});
+  }
+  setInterval(pollAgentStatus, 10000);
+
   function init(state){
     words=state.words||[]; segments=state.segments||[]; qa=state.qa||[];
     baseCut=new Set((state.decisions&&state.decisions.cut_word_ids)||[]);
@@ -2925,8 +3080,20 @@
         (h.brollSyncError?(" ("+h.brollSyncError+")"):"")+
         " — die Screen-Aufnahme klebt dadurch NICHT am Hauptvideo.");
       if(!h.srcVideo) msgs.push("Quellvideo nicht erreichbar — EDL-Wiedergabe und Re-Render deaktiviert.");
+      // PROXY-WARNUNG (01.09.): Ohne edit_intra_main.mp4 seekt jede Naht auf
+      // der Long-GOP-Quelle (250-3000ms) = Playhead stockt an jedem Schnitt.
+      // Genau dieser Zustand hiess frueher "das Stocken ist wieder da" — der
+      // Server loggte die Warnung nur ins Terminal, wo sie niemand sah.
+      if(state.sourceUrl && !state.playbackProxy) msgs.push(
+        "KEIN Playback-Proxy (edit_intra_main.mp4 fehlt) — Wiedergabe ruckelt an jeder "+
+        "Naht. Bauen: sh build_intra_all.sh <workdir>, dann Server neu starten.");
+      if(state.sourceUrl && !state.pauseMap) msgs.push(
+        "Keine Pausen-Karte (pause_map.json fehlt) — L-Cuts werden NICHT an die "+
+        "gemessene Stille geklemmt. Bauen: python scripts/pause_map.py work/<name>.");
       if(msgs.length){ hb.textContent="⚠ "+msgs.join("  ·  "); hb.classList.add("on"); }
     })();
+    initPauseMap(state.pauseMap||null);   // VOR dem Clip-Aufbau: clampJcuts braucht die Karte
+    renderAgentSessions(state.agentSessions||[]);   // Badge: persistente Agent-Sessions
     brollSync=state.brollSync||null;
     // pip-Konfiguration SEPARAT merken: brollSync wird weiter unten auf null
     // gesetzt, wenn es keine Screen-Quelle gibt (v8d: nur Grafiken). Die
@@ -3023,6 +3190,18 @@
   connect();
   document.getElementById("btnTermRestart").addEventListener("click", function(){
     fetch("/api/term/restart", {method:"POST"}).then(function(){
+      exitOv.style.display="none"; term.reset();
+      if(es) es.close(); connect(); setTimeout(doFit, 150);
+    }).catch(function(){});
+  });
+  // Agent-Session WIRKLICH beenden (tmux kill-session) — mit Rueckfrage,
+  // weil ein laufender Hintergrund-Auftrag (B-Roll-Bau) damit abbricht.
+  var bks=document.getElementById("btnKillSession");
+  if(bks) bks.addEventListener("click", function(){
+    if(!confirm("Agent-Session dieses Projekts wirklich beenden?\n"+
+                "Ein laufender Auftrag (z.B. B-Roll-Bau) bricht damit ab.\n"+
+                "Danach startet automatisch eine frische Session.")) return;
+    fetch("/api/term/kill_session", {method:"POST"}).then(function(){
       exitOv.style.display="none"; term.reset();
       if(es) es.close(); connect(); setTimeout(doFit, 150);
     }).catch(function(){});

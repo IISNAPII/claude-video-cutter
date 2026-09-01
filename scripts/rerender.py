@@ -60,7 +60,7 @@ def main():
                          "flags": ["timeline"]})
         if segs:
             segs[0]["jcut"] = 0.0          # der erste Clip hat keine linke Naht
-        apply_jcut_edges(segs)
+        apply_jcut_edges(segs, pauses=load_pause_map(os.path.dirname(os.path.abspath(ovr_path))))
         n_j = sum(1 for s in segs if s["jcut"] > 1e-3)
         # Fingerprint des Cockpit-Stands: beweist, WELCHER Stand gerendert
         # wird (Speicherzeit + Pruefsumme + Umfang). Gehoert in jede Uebergabe.
@@ -166,7 +166,54 @@ def main():
     render_segments(segs, src, out_mp4, mode, broll, workdir)
 
 
-def apply_jcut_edges(segs):
+def load_pause_map(workdir):
+    """Waveform-gemessene Sprechpausen (pause_map.py) auf der FILE-Achse.
+    None wenn keine Karte existiert — dann kann der Silence-Clamp nicht
+    greifen und apply_jcut_edges warnt bei gesetzten J-Cuts."""
+    p = os.path.join(workdir, "pause_map.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        doc = json.load(open(p))
+        off = 0.0
+        if doc.get("aligned") is False and isinstance(doc.get("audio_start"), (int, float)):
+            off = float(doc["audio_start"])
+        return sorted([a + off, b + off] for a, b in doc.get("pauses", []))
+    except Exception as e:  # noqa: BLE001
+        print(f"[rerender] ⚠ pause_map.json unlesbar ({e!r}) — Silence-Clamp inaktiv", flush=True)
+        return None
+
+
+def _tail_silence_at(pauses, t):
+    """Wieviel gemessene Stille liegt direkt vor Quellzeit t? (0 = Sprache)"""
+    import bisect
+    if not pauses:
+        return 0.0
+    i = bisect.bisect_right([p[0] for p in pauses], t) - 1
+    if i < 0:
+        return 0.0
+    s, e = pauses[i]
+    if t > e + 0.03:
+        return 0.0
+    return max(0.0, min(t, e) - s)
+
+
+def _head_silence_at(pauses, t):
+    """Wieviel gemessene Stille liegt direkt nach Quellzeit t?"""
+    import bisect
+    if not pauses:
+        return 0.0
+    i = bisect.bisect_right([p[0] for p in pauses], t) - 1
+    if i >= 0:
+        s, e = pauses[i]
+        if t <= e + 0.001:
+            return max(0.0, e - max(t, s))
+    if i + 1 < len(pauses) and pauses[i + 1][0] - t <= 0.03:
+        return pauses[i + 1][1] - pauses[i + 1][0]
+    return 0.0
+
+
+def apply_jcut_edges(segs, pauses=None):
     """Leitet Ton-Positionen und Bildkanten aus jcut ab (J-Cut / Split-Edit).
 
     jcut(i) = Sekunden, um die der TON von Segment i FRUEHER beginnt als sein
@@ -190,7 +237,10 @@ def apply_jcut_edges(segs):
     darauf).
     """
     MIN_VDUR = 0.05
+    SIL_MARGIN = 0.02      # Abstand zur gemessenen Sprach-Kante (wie Cockpit)
+    MIN_USEFUL = 0.04      # Mini-Vorlaeufe < 40ms bringen nichts
     n = len(segs)
+    n_sil_clamped = 0
     for i, s in enumerate(segs):
         s["_dur"] = s["out"] - s["in"]
     for i, s in enumerate(segs):
@@ -200,7 +250,29 @@ def apply_jcut_edges(segs):
             j = min(j, max(0.0, segs[i-1]["_dur"] - float(segs[i-1].get("jcut", 0) or 0) - 0.02))
             nxt = float(segs[i+1].get("jcut", 0) or 0) if i + 1 < n else 0.0
             j = min(j, max(0.0, s["_dur"] - nxt - 0.02))                     # Nicht-Nachbarn
+            # ECHO-CLAMP (01.09.): im Ueberlapp-Fenster spielen A-Schwanz und
+            # B-Kopf GLEICHZEITIG. Doppel-Sprache ist nur unmoeglich, wenn
+            # j <= tailSilence(A.out) + headSilence(B.in) — identische Formel
+            # im Cockpit (jcutEffOf). An normalen Naehten deckt Bs Anlauf-
+            # Stille den A-Schwanz (L-Cut bleibt voll), an Split-Naehten geht
+            # j gegen 0 (dort entstand das Echo vom 30.08.). Wirkt nur auf
+            # den Render, die Overrides bleiben unangetastet.
+            if pauses is not None and j > 1e-4:
+                room = max(0.0, _tail_silence_at(pauses, segs[i-1]["out"])
+                           + _head_silence_at(pauses, s["in"]) - SIL_MARGIN)
+                if j - room > 1e-4:
+                    n_sil_clamped += 1
+                    j = room
+            if 0 < j < MIN_USEFUL:
+                j = 0.0
         s["jcut"] = round(j, 4)
+    if n_sil_clamped:
+        print(f"[rerender] Silence-Clamp: {n_sil_clamped} J-Cut(s) auf die "
+              f"gemessene Naht-Stille geklemmt", flush=True)
+    if pauses is None and any(float(s.get("jcut", 0) or 0) > 1e-3 for s in segs[1:]):
+        print("[rerender] ⚠ J-Cuts gesetzt, aber KEINE pause_map.json — Clamp "
+              "inaktiv, Vorlauf kann in Sprache laufen. Bauen: "
+              "python scripts/pause_map.py <workdir>", flush=True)
     # FRAME-QUANTISIERUNG (01.08.2026) — sonst driftet das Bild gegen den Ton.
     #
     # ffmpeg schneidet Video zwangslaeufig auf Frame-Grenzen, Audio aber
@@ -225,17 +297,20 @@ def apply_jcut_edges(segs):
         s["v_in"] = round(s["in"] + j, 6)
         s["v_out"] = round(s["in"] + j + vdur_q, 6)            # Frame-Vielfaches
         s["a_start"] = round(v_start - j, 6)
-        # ROLL-SEMANTIK (30.08.): Der Ton von Segment i endet EXAKT dort, wo
-        # der Ton von Segment i+1 beginnt (a_start(i+1) = v_start(i)+vdur_q −
-        # jcut(i+1)) — KEINE Ueberlappung mehr. Vorher liefen im J-Cut-Fenster
-        # BEIDE Toene gleichzeitig (voll laut); bei Split-Naehten war das
-        # derselbe Take doppelt = hoerbares Echo (Sebastians "hoert sich an
-        # als wuerde etwas doppelt abgespielt"). Jetzt: harter Ton-Schnitt am
-        # Fensteranfang, Bild rollt wie gehabt spaeter — identisch zum
-        # Cockpit-Player (Roll-Transplantat 30.08.). Die Kette ist damit
-        # lueckenlos ueberlappungsfrei; Telescoping haelt Σ Ton == Σ Bild.
-        j_next = float(segs[i + 1].get("jcut", 0) or 0) if i + 1 < n else 0.0
-        s["a_dur"] = round(vdur_q + j - j_next, 6)             # Ton endet am naechsten Fensteranfang
+        # UEBERLAPP-SEMANTIK ZURUECK (01.09.): Der Ton jedes Segments spielt
+        # seine VOLLE Laenge — die Toene benachbarter Segmente ueberlappen um
+        # jcut (zwei alternierende Ketten + amix, wie urspruenglich gebaut).
+        #
+        # Die ROLL-Kuerzung vom 30.08. (a_dur = vdur_q + j − j_next) sollte
+        # den Doppelton-Befund fixen, hat aber bei jcut > echte Naht-Stille
+        # das LETZTE WORT jedes Segments mitten im Phonem gekappt (yt1b: 79%
+        # der 95 Naehte, Median-Stille 0,12s vs. jcut 0,25s) — Sebastians
+        # "Stotterer an jedem L-Cut". Der Doppelton selbst entstand aus der
+        # gleichen Fehlannahme (fester jcut ohne Stille-Pruefung). Beides
+        # fixt jetzt der SILENCE-CLAMP oben: jcut kann nie groesser sein als
+        # die per Waveform gemessene Stille am Vorgaenger-Ende -> es
+        # ueberlappt nur noch Stille mit Sprache. Kein Echo, kein Kappen.
+        s["a_dur"] = round(vdur_q + j, 6)      # Ton endet mit dem eigenen Bild
         v_start += vdur_q
     for s in segs:
         s.pop("_dur", None)

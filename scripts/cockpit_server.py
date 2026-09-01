@@ -402,6 +402,108 @@ TERM = {
 TERM_BUF_MAX = 400_000
 TERM_AGENT = "video-cutter"
 
+# --------------------------------------------------------------------------
+# PERSISTENTE AGENT-SESSIONS (01.09.2026): claude laeuft NICHT mehr als
+# direktes PTY-Kind des Servers, sondern in einer detachten tmux-Session
+# pro Projekt ("cutter-<projekt>"). Das Server-PTY ist nur noch das FENSTER
+# (tmux attach). Stirbt der Server (PROJEKT WECHSELN), stirbt nur der
+# Attach-Client — die Session arbeitet im Hintergrund weiter (z.B. B-Roll
+# fertig bauen) und wird beim naechsten Oeffnen desselben Projekts wieder
+# angedockt. tmux ist zugleich das Register (tmux ls).
+# Reboot-Recovery: tmux ueberlebt keinen Neustart; der SessionStart-Hook
+# (cutter_session_hook.py, Projekt-Settings) schreibt die Claude-Session-ID
+# nach <workdir>/claude_session.json -> Neustart mit `--resume <id>`.
+# --------------------------------------------------------------------------
+
+def tmux_session_name(workdir=None):
+    import re as _re
+    base = os.path.basename(os.path.abspath(workdir or CFG["workdir"]))
+    return "cutter-" + _re.sub(r"[^A-Za-z0-9_-]", "_", base)
+
+
+def tmux_has_session(name):
+    tb = shutil.which("tmux")
+    if not tb:
+        return False
+    try:
+        # "=" erzwingt exakten Namens-Match (sonst matcht tmux Praefixe:
+        # "cutter-v1" faende auch "cutter-v1b").
+        return subprocess.run([tb, "has-session", "-t", "=" + name],
+                              capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
+def tmux_ensure_session(name, cols, rows, claude_bin):
+    """Legt die detachte Projekt-Session an, falls sie fehlt. True = ok."""
+    tb = shutil.which("tmux")
+    if not tb or not claude_bin:
+        return False
+    if tmux_has_session(name):
+        return True
+    inner = "%s --agent %s" % (shlex.quote(claude_bin), TERM_AGENT)
+    sj = load_json(os.path.join(CFG["workdir"], "claude_session.json"), {}) or {}
+    rid = str(sj.get("session_id") or "").strip()
+    if rid and all(ch.isalnum() or ch in "-_" for ch in rid):
+        # Kontext der letzten Session zurueckholen; unbekannte ID -> frisch.
+        inner = ("%s --agent %s --resume %s || %s --agent %s"
+                 % (shlex.quote(claude_bin), TERM_AGENT, shlex.quote(rid),
+                    shlex.quote(claude_bin), TERM_AGENT))
+    try:
+        subprocess.run(
+            [tb, "new-session", "-d", "-s", name,
+             "-x", str(int(cols)), "-y", str(int(rows)),
+             "-c", os.path.dirname(HERE),
+             "-e", "CUTTER_WORKDIR=%s" % os.path.abspath(CFG["workdir"]),
+             "-e", "CUTTER_PROJECT=%s" % os.path.basename(os.path.abspath(CFG["workdir"])),
+             "-e", "TERM=xterm-256color",
+             "/bin/zsh", "-lc", inner],
+            check=True, capture_output=True, timeout=10)
+        # tmux-Statusleiste aus: im Cockpit soll es wie ein nacktes Claude
+        # aussehen, nicht wie ein Terminal-Multiplexer.
+        subprocess.run([tb, "set-option", "-t", "=" + name, "status", "off"],
+                       capture_output=True, timeout=5)
+        print("[cockpit] Agent-Session NEU: tmux %s%s"
+              % (name, " (resume %s)" % rid[:8] if rid else ""), flush=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        print("[cockpit] ⚠ tmux new-session fehlgeschlagen (%r) -> Direkt-PTY" % (e,),
+              flush=True)
+        return False
+
+
+def agent_sessions_info():
+    """Alle laufenden cutter-* Sessions + ihr Status (fuer Badge/Uebersicht)."""
+    out = []
+    tb = shutil.which("tmux")
+    if not tb:
+        return out
+    try:
+        r = subprocess.run(
+            [tb, "list-sessions", "-F",
+             "#{session_name}|#{session_created}|#{session_attached}"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return out
+    if r.returncode != 0:
+        return out
+    work_root = os.path.dirname(os.path.abspath(CFG["workdir"]))
+    for line in r.stdout.strip().splitlines():
+        p = line.split("|")
+        if not p or not p[0].startswith("cutter-"):
+            continue
+        proj = p[0][len("cutter-"):]
+        wd = os.path.join(work_root, proj)
+        st = load_json(os.path.join(wd, "agent_status.json"), {}) or {}
+        out.append({
+            "session": p[0], "projekt": proj,
+            "attached": len(p) > 2 and p[2] not in ("", "0"),
+            "aktuell": os.path.abspath(wd) == os.path.abspath(CFG["workdir"]),
+            "status": st.get("status"), "ts": st.get("ts"),
+            "aufgabe": st.get("aufgabe"),
+        })
+    return out
+
 
 
 def _term_fail(msg):
@@ -422,17 +524,9 @@ def _term_start_windows(cols=120, rows=32):
             return _term_fail("claude nicht im PATH gefunden - ist Claude Code installiert?")
         env = dict(os.environ)
         env["TERM"] = "xterm-256color"
-        # npm-Installationen liefern einen claude.cmd-Shim, den ConPTY nicht
-        # direkt starten kann -> echte .exe suchen, sonst ueber cmd.exe starten.
-        if exe.lower().endswith((".cmd", ".bat")):
-            native = os.path.expandvars(r"%USERPROFILE%\.local\bin\claude.exe")
-            argv = [native, "--agent", TERM_AGENT] if os.path.exists(native) \
-                else ["cmd.exe", "/c", exe, "--agent", TERM_AGENT]
-        else:
-            argv = [exe, "--agent", TERM_AGENT]
         try:
             proc = winpty.PtyProcess.spawn(
-                argv,
+                [exe, "--agent", TERM_AGENT],
                 cwd=os.path.dirname(HERE),
                 env=env,
                 dimensions=(int(rows), int(cols)),
@@ -477,11 +571,23 @@ def term_start(cols=120, rows=32):
         # nicht-interaktive Login-Shell liest .zprofile, aber NICHT .zshrc —
         # dort steht bei npm-global-Installationen aber der Pfad zu `claude`.
         claude_bin = shutil.which("claude")
+        tmux_bin = shutil.which("tmux")
+        sess = tmux_session_name()
+        # PERSISTENZ: Session detached anlegen (oder vorhandene weiternutzen),
+        # das PTY hier ist nur noch der Attach-Client. Faellt tmux aus,
+        # laeuft der alte Direkt-PTY-Pfad als Fallback (Session stirbt dann
+        # wieder mit dem Server — besser als gar kein Terminal).
+        use_tmux = bool(tmux_bin) and tmux_ensure_session(sess, cols, rows, claude_bin)
         pid, fd = pty.fork()
         if pid == 0:
-            # Kind: claude im Login-Shell-Kontext starten (PATH/nvm etc.)
+            # Kind: Attach-Client bzw. Fallback-claude im Login-Shell-Kontext
             os.chdir(os.path.dirname(HERE))
             os.environ["TERM"] = "xterm-256color"
+            # Hooks (cutter_session_hook.py) brauchen den Projekt-Kontext auch
+            # im Fallback-Pfad:
+            os.environ["CUTTER_WORKDIR"] = os.path.abspath(CFG["workdir"])
+            if use_tmux:
+                os.execvp(tmux_bin, [tmux_bin, "attach-session", "-t", "=" + sess])
             if not claude_bin:
                 # Nicht still sterben — sonst bleibt die rechte Spalte leer und
                 # niemand weiss warum (genau so ist es am 31.07. passiert).
@@ -500,6 +606,7 @@ def term_start(cols=120, rows=32):
         TERM["pid"] = pid
         TERM["buf"] = b""
         TERM["alive"] = True
+        TERM["tmux"] = use_tmux
     term_resize(cols, rows)
     threading.Thread(target=_term_reader, daemon=True).start()
 
@@ -572,6 +679,8 @@ def term_write(data):
 
 
 def term_kill():
+    # Beendet nur den ATTACH-Client (Fenster zu) — die tmux-Session und der
+    # Claude darin laufen weiter. Fuer das echte Beenden: term_kill_session().
     with TERM["lock"]:
         pid = TERM["pid"]
         wproc = TERM["wproc"]
@@ -588,6 +697,38 @@ def term_kill():
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, OSError):
             pass
+
+
+def term_kill_session():
+    """Beendet die persistente Agent-Session dieses Projekts WIRKLICH."""
+    term_kill()
+    tb = shutil.which("tmux")
+    sess = tmux_session_name()
+    if tb:
+        try:
+            subprocess.run([tb, "kill-session", "-t", "=" + sess],
+                           capture_output=True, timeout=5)
+            print("[cockpit] Agent-Session beendet: %s" % sess, flush=True)
+        except Exception:
+            pass
+    # BEWUSSTES Beenden -> die naechste Session soll FRISCH starten, nicht
+    # die eben gekillte resumen. claude_session.json ist nur fuer die
+    # Reboot-Recovery (Session starb OHNE Nutzer-Absicht) gedacht.
+    try:
+        os.unlink(os.path.join(CFG["workdir"], "claude_session.json"))
+    except OSError:
+        pass
+    # Status ehrlich machen (der SessionEnd-Hook feuert bei kill-session nicht
+    # zuverlaessig — SIGHUP kann Hooks abschneiden):
+    try:
+        p = os.path.join(CFG["workdir"], "agent_status.json")
+        st = load_json(p, {}) or {}
+        st.update({"status": "beendet", "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
+        with open(p + ".tmp", "w") as f:
+            json.dump(st, f, ensure_ascii=False)
+        os.replace(p + ".tmp", p)
+    except Exception:
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -700,6 +841,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.serve_media(f)
             if route == "/api/term/stream":
                 return self.serve_term_stream()
+            if route == "/api/agent_status":
+                return self._send_json({"sessions": agent_sessions_info(),
+                                        "projekt": os.path.basename(os.path.abspath(CFG["workdir"]))})
             if route.startswith("/vendor/"):
                 return self.serve_vendor(route)
             self._send_json({"error": "not found", "path": route}, HTTPStatus.NOT_FOUND)
@@ -730,6 +874,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.term_resize_route()
             if route == "/api/term/restart":
                 return self.term_restart()
+            if route == "/api/term/kill_session":
+                return self.term_kill_session_route()
             self._send_json({"error": "not found", "path": route}, HTTPStatus.NOT_FOUND)
         except BrokenPipeError:
             pass
@@ -762,14 +908,35 @@ class Handler(BaseHTTPRequestHandler):
             clips = [{"in": x["in"], "out": x["out"]}
                      for x in (seg_doc.get("segments") or []) if x["out"] > x["in"]]
 
+        # ACHSE MIT J-CUTS (01.09.): Die alte Kumulation (Σ out−in) ignorierte
+        # jcut — bei mod4v2 (25,75s Σ jcut) traf ein T-Marker-Auftrag am
+        # Videoende die Rohstelle 25,75s zu frueh, das Briefing zitierte
+        # falschen Text. Jetzt rechnet dieselbe Implementierung wie der
+        # Render (apply_jcut_edges inkl. Echo-Clamp) die BILD-Achse:
+        # Output t im Clip i -> raw = v_in + (t − v_start).
+        _axis = [{"in": float(c["in"]), "out": float(c["out"]),
+                  "jcut": max(0.0, float(c.get("jcut", 0) or 0))}
+                 for c in clips if float(c["out"]) - float(c["in"]) >= 0.04]
+        if _axis:
+            _axis[0]["jcut"] = 0.0
+        try:
+            import rerender as _rr
+            _rr.apply_jcut_edges(_axis, pauses=_rr.load_pause_map(CFG["workdir"]))
+        except Exception as _e:  # noqa: BLE001 — Fallback: Achse ohne jcut (alter Stand)
+            print("[cockpit] ⚠ Briefing-Achse ohne jcut (%r)" % (_e,), flush=True)
+            _cum = 0.0
+            for _s in _axis:
+                _s["v_in"], _s["v_out"], _s["v_start"] = _s["in"], _s["out"], _cum
+                _cum += _s["out"] - _s["in"]
+
         def raw_ranges(oa, ob):
-            res, cum = [], 0.0
-            for c in clips:
-                d = c["out"] - c["in"]
-                x, y = max(oa, cum), min(ob, cum + d)
+            res = []
+            for s in _axis:
+                vdur = s["v_out"] - s["v_in"]
+                x, y = max(oa, s["v_start"]), min(ob, s["v_start"] + vdur)
                 if y > x:
-                    res.append((c["in"] + (x - cum), c["in"] + (y - cum)))
-                cum += d
+                    res.append((s["v_in"] + (x - s["v_start"]),
+                                s["v_in"] + (y - s["v_start"])))
             return res
 
         def out_to_raw(t):
@@ -796,7 +963,7 @@ class Handler(BaseHTTPRequestHandler):
                     best = best or "Bildschirmaufnahme"
             return best or "Talking-Head (Sprecher fullscreen)"
 
-        total = sum(c["out"] - c["in"] for c in clips)
+        total = sum(s["v_out"] - s["v_in"] for s in _axis)   # echte Output-Laenge (mit jcuts)
         tc = lambda t: "%d:%02d" % (int(t // 60), int(t % 60))
         brief = {
             "typ": "broll_auftrag",
@@ -944,10 +1111,21 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": True})
 
     def term_restart(self):
+        # Mit tmux: nur das FENSTER neu verbinden (Session laeuft weiter).
         if not self._term_origin_ok():
             return self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
         term_kill()
         time.sleep(0.4)
+        term_start()
+        self._send_json({"ok": True})
+
+    def term_kill_session_route(self):
+        # Beendet die PERSISTENTE Agent-Session (tmux + Claude) wirklich und
+        # startet ein frisches Terminal-Fenster mit neuer Session.
+        if not self._term_origin_ok():
+            return self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
+        term_kill_session()
+        time.sleep(0.6)
         term_start()
         self._send_json({"ok": True})
 
@@ -1013,6 +1191,13 @@ class Handler(BaseHTTPRequestHandler):
             "audioAligned": bool(CFG.get("audio_aligned")),
             "mediaBase": mb,
             "playbackProxy": bool(CFG.get("playback_map")),
+            # PAUSEN-KARTE (01.09.): waveform-gemessene Sprechpausen fuer den
+            # L-Cut-Silence-Clamp im Player (pause_map.py). Ohne Karte klemmt
+            # der Player J-Cuts NICHT an die Stille — Banner weist darauf hin.
+            "pauseMap": load_json(os.path.join(CFG["workdir"], "pause_map.json"), None),
+            # PERSISTENTE AGENT-SESSIONS (01.09.): laufende cutter-* Sessions
+            # aller Projekte (Badge + Hintergrund-Anzeige im Frontend).
+            "agentSessions": agent_sessions_info(),
             "brollSync": bs_info,
             "brollUrl": ((mb + "/media/broll.mp4") if bs_info else None),
             # Selbstdiagnose fuers Frontend-Banner: was fehlt, wenn etwas fehlt
