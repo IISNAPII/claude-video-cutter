@@ -1,5 +1,13 @@
 # Claude Video-Cutter
 
+> **Produktionsstand vom 23.09.2026.** Cockpit und benötigte Runtime-Dateien
+> wurden aus dem aktuellen lokalen Produktionssystem übernommen. Nach dem
+> Update die Abhängigkeiten aus `requirements.txt` erneut installieren.
+> Dieser Stand ist macOS-basiert. Die ältere Windows-Portierung wurde beim
+> Produktionsabgleich nicht erneut angewendet; Windows ist in diesem Stand
+> nicht unterstützt. Optionale Codex- und B-Roll-Funktionen setzen das
+> entsprechende zusätzliche Agenten-/Profil-Setup voraus.
+
 Ein Claude-Code-Agent, der lange Talking-Head- und Tutorial-Videos (20-90 Min,
 deutsch) end-to-end schneidet: Verbatim-Transkription, redaktionelle
 Cut-Entscheidungen (Retakes, Versprecher, Fehlstarts, Nicht-Content),

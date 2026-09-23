@@ -7,3 +7,7 @@ faster-whisper==1.2.1
 
 # Windows-Terminal (ConPTY) — nur auf Windows installiert
 pywinpty>=3.0.5; sys_platform == "win32"
+
+# Dependencies of the shared production cockpit
+Pillow==12.3.0
+opencv-python==5.0.0.93

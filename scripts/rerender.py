@@ -57,6 +57,8 @@ def main():
                          "first_id": tc.get("id", f"tl{len(segs)}"),
                          "gain_db": float(tc.get("gain", 0) or 0),
                          "jcut": max(0.0, float(tc.get("jcut", 0) or 0)),
+                         **({"jcutMode": "manual"} if tc.get("jcutMode") == "manual" else {}),
+                         **{k: float(tc.get(k, 0) or 0) for k in LOOK_KEYS},
                          "flags": ["timeline"]})
         if segs:
             segs[0]["jcut"] = 0.0          # der erste Clip hat keine linke Naht
@@ -67,7 +69,7 @@ def main():
         import hashlib, time as _time
         _fp = hashlib.md5(open(ovr_path, "rb").read()).hexdigest()[:10]
         _mt = _time.strftime("%d.%m.%Y %H:%M:%S", _time.localtime(os.path.getmtime(ovr_path)))
-        _soll = sum(s["v_out"] - s["v_in"] for s in segs)
+        _soll = sum(s.get("v_duration", s["v_out"] - s["v_in"]) for s in segs)
         print(f"[rerender] Cockpit-Stand: gespeichert {_mt} (md5 {_fp}) — "
               f"{len(segs)} Clips, {len(broll)} B-Roll-Slots, Soll-Laenge {_soll:.3f}s", flush=True)
         print(f"[rerender] TIMELINE-Modus: {len(segs)} Clips direkt aus dem Cockpit"
@@ -166,6 +168,84 @@ def main():
     render_segments(segs, src, out_mp4, mode, broll, workdir)
 
 
+LOOK_KEYS = ("exp", "bri", "con", "sat", "tmp", "tnt", "shp", "hig", "sha")
+
+
+def build_geo_filter(c, w=1080, h=1920):
+    """Bildversatz pro Clip -> pad+crop (04.09., ohne Zoom).
+
+    Sebastian will das Bild schieben wie einen Textkasten: nach oben, unten,
+    links, rechts — und sonst nichts. Kein Hineinzoomen, keine Skalierung.
+    Was am Rand hinauswandert, ist auf der anderen Seite schwarz; das ist
+    gewollt und dieselbe Logik, die er von CapCut kennt.
+
+    ox/oy in Prozent der Bildbreite/-hoehe, positiv = nach rechts / nach unten.
+    Gleiche Formel wie clipGeoCss() im Cockpit: dort translate(ox%, oy%).
+    """
+    ox = float(c.get("ox") or 0)
+    oy = float(c.get("oy") or 0)
+    if abs(ox) < 0.01 and abs(oy) < 0.01:
+        return f"scale={w}:{h}"
+    dx = int(round(w * ox / 100.0))
+    dy = int(round(h * oy / 100.0))
+    ax, ay = abs(dx), abs(dy)
+    # Leinwand beidseitig aufweiten, Bild versetzt hineinlegen, Fenster
+    # wieder herausschneiden: verschiebt ohne zu skalieren.
+    return (f"scale={w}:{h},"
+            f"pad={w + 2 * ax}:{h + 2 * ay}:{ax + dx}:{ay + dy}:black,"
+            f"crop={w}:{h}:{ax}:{ay}")
+
+
+def build_look_filter(c):
+    """CapCut-Farb-Look pro Clip -> ffmpeg-Filterkette (mit fuehrendem Komma).
+
+    CapCut-Skala -50..+50 (Schaerfe 0..100). Die exakten CapCut-Formeln sind
+    nicht oeffentlich — exp und sat sind deshalb GEMESSEN (03.09.2026), nicht
+    geraten: Sebastians Rohaufnahme IMG_0910 gegen seinen CapCut-Export des
+    gleichen Videos (Tag 210), Frames geometrisch registriert (Talking Head
+    im Export 1.22x skaliert, ~195px versetzt), Delta in CIELAB auf fester
+    Pixelmaske. Sein Standard sat +5 / exp -5 wirkt dort dL*=-6.09 bei
+    dC*=+1.6%. Diese Kalibrierung trifft das auf dL*=-6.09 / dC*=+1.7%.
+    Messkript + Frames: siehe Commit-Nachricht.
+    Die uebrigen Achsen bleiben auf der Schaetzung von 01.09.:
+      exp  Belichtung   EV = v/25           (exposure-Filter)
+      bri  Helligkeit   additiv v/250       (eq=brightness)
+      con  Kontrast     Faktor 1+v/100      (eq=contrast)
+      sat  Saettigung   Faktor 1+v/36       (eq=saturation)
+      tmp  Temperatur   6500K − v*35        (colortemperature; +v = waermer)
+      tnt  Tint         gm = −v/150         (colorbalance; +v = magenta)
+      hig  Highlights   Kurvenpunkt 0.75 +/- v/500 (curves)
+      sha  Schatten     Kurvenpunkt 0.25 +/- v/500 (curves)
+      shp  Schaerfe     unsharp amount v/66 (max 1.5)
+    IDENTISCHE Abbildung in der Cockpit-Live-Preview (clipLookCss/feColorMatrix).
+    """
+    def g(k):
+        return float(c.get(k, 0) or 0)
+    f = ""
+    if abs(g("exp")) > 0.01:
+        f += f",exposure=exposure={g('exp')/25.0:.3f}"
+    eq = []
+    if abs(g("bri")) > 0.01:
+        eq.append(f"brightness={g('bri')/250.0:.4f}")
+    if abs(g("con")) > 0.01:
+        eq.append(f"contrast={1 + g('con')/100.0:.3f}")
+    if abs(g("sat")) > 0.01:
+        eq.append(f"saturation={1 + g('sat')/36.0:.3f}")
+    if eq:
+        f += ",eq=" + ":".join(eq)
+    if abs(g("tmp")) > 0.01:
+        f += f",colortemperature=temperature={6500 - g('tmp')*35:.0f}"
+    if abs(g("tnt")) > 0.01:
+        f += f",colorbalance=gm={-g('tnt')/150.0:.4f}"
+    if abs(g("hig")) > 0.01 or abs(g("sha")) > 0.01:
+        y1 = min(0.45, max(0.05, 0.25 + g("sha")/500.0))
+        y2 = min(0.95, max(0.55, 0.75 + g("hig")/500.0))
+        f += f",curves=master='0/0 0.25/{y1:.3f} 0.75/{y2:.3f} 1/1'"
+    if g("shp") > 0.01:
+        f += f",unsharp=5:5:{min(2.0, g('shp')/66.0):.3f}"
+    return f
+
+
 def load_pause_map(workdir):
     """Waveform-gemessene Sprechpausen (pause_map.py) auf der FILE-Achse.
     None wenn keine Karte existiert — dann kann der Silence-Clamp nicht
@@ -213,7 +293,54 @@ def _head_silence_at(pauses, t):
     return 0.0
 
 
-def apply_jcut_edges(segs, pauses=None):
+def apply_manual_jcut_edges(segs, pauses=None, fps=None):
+    """Explicit overlaps: full source audio, UI clock, absolute video frame grid.
+
+    Missing jcutMode still uses the legacy silence policy. Only projects with
+    an explicit manual seam enter this path; old renders remain unchanged.
+    Geometry matches cockpit jcutMax/clampJcuts (.20s picture, .05s neighbour).
+    """
+    fps = float(FPS if fps is None else fps)
+    if not fps > 0:
+        raise ValueError("fps must be positive")
+    durations = [float(s["out"]) - float(s["in"]) for s in segs]
+    requested = [max(0.0, float(s.get("jcut", 0) or 0)) for s in segs]
+    if requested:
+        requested[0] = 0.0
+    # Clamp all requests BEFORE the silence pass, exactly like the UI. Using
+    # a previous already silence-clamped value would give different geometry.
+    for i in range(1, len(segs)):
+        nxt = requested[i + 1] if i + 1 < len(segs) else 0.0
+        room = max(0.0, min(durations[i] - .20,
+                           durations[i-1] - requested[i-1] - .05,
+                           durations[i] - nxt - .05))
+        requested[i] = round(min(requested[i], room), 4)
+    audio_end = 0.0
+    for i, s in enumerate(segs):
+        j = requested[i]
+        if s.get("jcutMode") != "manual" and pauses is not None and i and j > .001:
+            room = max(0.0, _tail_silence_at(pauses, segs[i-1]["out"])
+                       + _head_silence_at(pauses, s["in"]) - .02)
+            j = min(j, room)
+            if j < .04:
+                j = 0.0
+        j = round(j, 4)
+        a_start = audio_end - j
+        next_end = a_start + durations[i]
+        v_start = round(audio_end * fps) / fps
+        v_end = round(next_end * fps) / fps
+        # Video can only switch on a frame. Audio never follows per-clip frame
+        # rounding: all source samples remain and there is no cumulative drift.
+        v_in = min(float(s["out"]), max(float(s["in"]), float(s["in"]) + v_start - a_start))
+        s.update(jcut=j, a_start=round(a_start, 6), a_dur=round(durations[i], 6),
+                 v_start=round(v_start, 6), v_in=round(v_in, 6),
+                 v_out=round(min(float(s["out"]), v_in + v_end - v_start), 6),
+                 v_frames=round((v_end-v_start)*fps), v_duration=round(v_end-v_start, 6), audio_exact=True)
+        audio_end = next_end
+    return segs
+
+
+def apply_jcut_edges(segs, pauses=None, fps=None):
     """Leitet Ton-Positionen und Bildkanten aus jcut ab (J-Cut / Split-Edit).
 
     jcut(i) = Sekunden, um die der TON von Segment i FRUEHER beginnt als sein
@@ -236,6 +363,9 @@ def apply_jcut_edges(segs, pauses=None):
     Clampt defensiv (das Cockpit clampt schon, der Render verlaesst sich nicht
     darauf).
     """
+    if any(s.get("jcutMode") == "manual" and float(s.get("jcut", 0) or 0) > .001 for s in segs):
+        return apply_manual_jcut_edges(segs, pauses, fps)
+
     MIN_VDUR = 0.05
     SIL_MARGIN = 0.02      # Abstand zur gemessenen Sprach-Kante (wie Cockpit)
     MIN_USEFUL = 0.04      # Mini-Vorlaeufe < 40ms bringen nichts
@@ -365,7 +495,7 @@ def render_base_split(segs, src, mode, vf_extra, venc, tmp):
     asegs = [s for s in segs if s["out"] > s["in"]]
     n_j = sum(1 for s in segs if float(s.get("jcut", 0) or 0) > 1e-3)
     sum_j = sum(float(s.get("jcut", 0) or 0) for s in segs)
-    total_v = sum(s["v_out"] - s["v_in"] for s in vsegs)
+    total_v = sum(s.get("v_duration", s["v_out"] - s["v_in"]) for s in vsegs)
     total_a = max(s["a_start"] + float(s.get("a_dur", s["out"] - s["in"])) for s in asegs)
     print(f"[rerender] J-CUT: {len(vsegs)} Bildclips / {len(asegs)} Tonclips, "
           f"{n_j}× J-Cut ({sum_j:.1f}s Vorlauf gesamt), mode={mode}", flush=True)
@@ -391,15 +521,21 @@ def render_base_split(segs, src, mode, vf_extra, venc, tmp):
             # zu wenig — ueber 213 Clips fehlten so 10 Frames = 333 ms Drift.
             # Deshalb: etwas Reserve schneiden, auf 30 fps rastern, dann per
             # select exakt die ersten N Frames behalten.
-            nfr = max(1, round((s['v_out'] - s['v_in']) * FPS))
+            nfr = int(s.get('v_frames', max(1, round((s['v_out'] - s['v_in']) * FPS))))
             # tpad klont den letzten Frame, falls die Reserve nicht reicht
             # (z.B. am Dateiende) — sonst liefert select weniger als nfr und
             # der Clip ist einen Frame zu kurz. select begrenzt danach exakt.
-            parts += (f"[0:v]trim={s['v_in']:.4f}:{s['v_out'] + 0.2:.4f},"
+            # FARB-LOOK (01.09.): kompletter CapCut-Regler-Satz pro Clip
+            # (build_look_filter — eine Tabelle fuer beide Renderer + Preview)
+            look = build_look_filter(s)
+            stop = min(s["out"], s["v_out"] + .2) if s.get("audio_exact") else s["v_out"] + .2
+            trim_video = (f"{s['v_in']:.6f}:{stop:.6f}" if s.get("audio_exact")
+                          else f"{s['v_in']:.4f}:{stop:.4f}")
+            parts += (f"[0:v]trim={trim_video},"
                       f"setpts=PTS-STARTPTS,fps={FPS:g},"
                       f"tpad=stop_mode=clone:stop_duration=0.5,"
                       + "select='lt(n\\," + str(nfr) + ")',setpts=N/" + f"{FPS:g}" + "/TB"
-                      f"{vf_extra}[v{k}];")
+                      f"{look}{vf_extra}[v{k}];")
             ci += f"[v{k}]"
         # setpts NACH dem concat: concat setzt die PTS des Folgeclips ans Ende
         # des vorherigen — durch Zeitbasis-Rundung landen dabei einzelne Frames
@@ -414,7 +550,7 @@ def render_base_split(segs, src, mode, vf_extra, venc, tmp):
              "-map", "[v]", "-an", *venc,
              "-fps_mode", "passthrough", "-video_track_timescale", str(int(FPS * 1000)),
              bf])   # kein Re-Rastern: jeder gelieferte Frame landet in der Datei
-        vparts.append((bf, sum(max(1, round((s['v_out'] - s['v_in']) * FPS)) for s in chunk)))
+        vparts.append((bf, sum(int(s.get('v_frames', max(1, round((s['v_out'] - s['v_in']) * FPS)))) for s in chunk)))
         print(f"[rerender]   Bild-Batch {bi//BATCH+1}/{(len(vsegs)+BATCH-1)//BATCH}", flush=True)
     vid = os.path.join(tmp, "video.mp4")
     if len(vparts) == 1:
@@ -453,7 +589,13 @@ def render_base_split(segs, src, mode, vf_extra, venc, tmp):
             e = st + dur
             pos = s["a_start"]
             gap = pos - cursor
-            if gap > 0.0005:                       # Stille bis zum Stueckanfang
+            if s.get("audio_exact"):
+                # Integer 48k samples avoid cumulative concat-gap rounding.
+                gap_samples = round(pos * 48000) - round(cursor * 48000)
+                if gap_samples > 0:
+                    parts += f"[1:a]atrim=end_sample={gap_samples},asetpts=PTS-STARTPTS,{AF}[p{par}s{n}];"
+                    seq += f"[p{par}s{n}]"
+            elif gap > 0.0005:                     # Stille bis zum Stueckanfang
                 parts += f"[1:a]atrim=0:{gap:.4f},asetpts=PTS-STARTPTS,{AF}[p{par}s{n}];"
                 seq += f"[p{par}s{n}]"
             # NUR Declick-Fades (12ms), KEINE Kreuzblende ueber die Ueberlappung.
@@ -464,11 +606,14 @@ def render_base_split(segs, src, mode, vf_extra, venc, tmp):
             fout = min(FADE_S, dur / 2.0)
             g = s.get("gain_db", 0.0)
             vol = f",volume={g:.1f}dB" if abs(g) > 0.01 else ""
-            parts += (f"[0:a]atrim={st:.4f}:{e:.4f},asetpts=PTS-STARTPTS,"
+            trim_audio = (f"aresample=48000,atrim=start_sample={round(st*48000)}:end_sample={round(s['out']*48000)}"
+                          if s.get("audio_exact") else f"atrim={st:.4f}:{e:.4f}")
+            parts += (f"[0:a]{trim_audio},asetpts=PTS-STARTPTS,"
                       f"afade=t=in:st=0:d={fin:.4f},"
                       f"afade=t=out:st={dur-fout:.4f}:d={fout:.4f}{vol},{AF}[p{par}a{n}];")
             seq += f"[p{par}a{n}]"
-            cursor = pos + dur
+            cursor = ((round(pos*48000) + round(s["out"]*48000) - round(st*48000)) / 48000
+                      if s.get("audio_exact") else pos + dur)
         nseg = seq.count("[")
         parts += f"{seq}concat=n={nseg}:v=0:a=1[chain{par}];"
         chains.append(f"[chain{par}]")
@@ -520,7 +665,7 @@ def render_segments(segs, src, out_mp4, mode, broll, workdir):
         else:
             # HARDWARE-ENCODER (15.08.): 3-5x schneller; nur noch fuer den
             # alten concat-Normal-Pfad ohne Tonketten.
-            venc = ["-c:v", "h264_videotoolbox" if sys.platform == "darwin" else "libx264", "-b:v", "10M",
+            venc = ["-c:v", "h264_videotoolbox", "-b:v", "10M",
                     "-profile:v", "high", "-pix_fmt", "yuv420p"]
     elif mode == "max":
         # Master-Qualitaet fuer den Upload. Dieser Schritt ist nur ein

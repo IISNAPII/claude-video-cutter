@@ -31,6 +31,14 @@ import sys, os, json, subprocess, tempfile
 
 import numpy as np
 import cv2
+from frame_timed_screen_slots import frame_timed_screen_slots
+
+
+def facecam_enable(expression, slots):
+    """Suppress circle and shadow only inside explicitly opted-in free slots."""
+    hidden = [f"gte(t,{s['a']:.6f})*lt(t,{s['b']:.6f})"
+              for s in slots if s.get("hide_facecam") is True]
+    return f"({expression})*not({'+'.join(hidden)})" if hidden else expression
 
 
 def run(cmd):
@@ -138,6 +146,15 @@ def main():
             _ovr_early = json.load(open(ovr_path))
         except Exception:
             _ovr_early = {}
+    effective = json.load(open(segs_path))
+    cfg, _ovr_early, frame_audit = frame_timed_screen_slots(cfg, _ovr_early, effective)
+    exact_screen_frames = cfg.get("exact_screen_frames") is True
+    if exact_screen_frames:
+        cfg["force_two_pass"] = True
+    if frame_audit["applied"]:
+        print(f"[sync] Screen-Slots auf effektives Bildraster abgebildet "
+              f"({frame_audit['screen_pieces']} Stuecke, "
+              f"max. {frame_audit['max_start_shift_ms']:.3f} ms Korrektur)", flush=True)
     converted = _ovr_early.get("broll_sync_converted", [])
     sync_off = set(_ovr_early.get("broll_sync_off", []))
 
@@ -154,7 +171,7 @@ def main():
 
     sources = load_sources(cfg, converted)
 
-    segs = json.load(open(segs_path))["segments"]
+    segs = effective["segments"]
     segs = [s for s in segs if s["out"] > s["in"]]
     W, H, _ = probe_wh_dur(base_mp4)
     # render_size (Config, [W,H]): Composite auf Ziel-Groesse rendern (Base
@@ -179,12 +196,13 @@ def main():
     sync_holes = []
     if os.path.exists(ovr_path):
         try:
-            _ovr = json.load(open(ovr_path))
+            _ovr = _ovr_early
             for b in _ovr.get("broll", []):
                 if (b.get("file") and os.path.exists(b["file"])
                         and float(b.get("end", 0)) > float(b.get("start", 0))):
                     slot_defs.append({"a": float(b["start"]), "b": float(b["end"]),
                                       "file": b["file"],
+                                      "hide_facecam": b.get("kind") == "free" and b.get("hide_facecam") is True,
                                       "src_in": float(b.get("src_in", 0) or 0)})
             # Sync-Loecher (SOURCE-Zeit): vom Cockpit ausgeblendete Teile der
             # Screen-B-Rolls (W/Q/E/Entf auf Sync-Stuecke)
@@ -234,7 +252,9 @@ def main():
     for s in segs:
         s_in = float(s.get("v_in", s["in"]))
         s_out = float(s.get("v_out", s["out"]))
-        d = s_out - s_in
+        d = float(s.get("v_duration", s_out - s_in))
+        if s.get("audio_exact"):
+            cum = float(s["v_start"])
         if str(s.get("first_id", "")) in sync_off:
             cum += d
             continue
@@ -322,7 +342,8 @@ def main():
     if pieces:
         cur_c = [pieces[0]]; cur_r = [pieces[0]]
         for p in pieces[1:]:
-            contiguous = (p[0] - cur_c[-1][1] < 0.05)
+            contiguous = (round(p[0] * 30) == round(cur_c[-1][1] * 30)
+                          if exact_screen_frames else p[0] - cur_c[-1][1] < 0.05)
             if contiguous:
                 cur_c.append(p)
             else:
@@ -409,6 +430,7 @@ def main():
             merged_win.append([a, b])
     circle_win = [(a, b) for a, b in merged_win]
     enable = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in circle_win)
+    enable = facecam_enable(enable, slot_defs)
     # Rein/Raus-Animation (pip.transition.dur > 0): Kreis+Schatten sliden am
     # Fensterstart von unten rein und am Fensterende wieder raus (ease-out).
     # Sebastian (02.08.): KEINE Rein/Raus-Animation der Facecam. Der Kreis ist
@@ -433,8 +455,9 @@ def main():
     # genau diese Klasse gebaut (yt1b: 184 Stuecke fehlerfrei).
     TWO_PASS_THRESHOLD = 40
     run_files = None
-    if len(pieces) > TWO_PASS_THRESHOLD:
-        print(f"[sync] {len(pieces)} Stuecke > {TWO_PASS_THRESHOLD} -> Two-Pass "
+    if len(pieces) > TWO_PASS_THRESHOLD or cfg.get("force_two_pass") is True:
+        print(f"[sync] {len(pieces)} Stuecke, Schwelle {TWO_PASS_THRESHOLD}, "
+              f"force_two_pass={cfg.get('force_two_pass') is True} -> Two-Pass "
               f"(pro Run rendern, sequenziell)", flush=True)
         run_files = []
         for ri, r in enumerate(runs):
@@ -460,14 +483,20 @@ def main():
             parts1 = []
             for j1, (tla, tlb, si, bra, brb) in enumerate(r):
                 k = ti[si]; ti[si] += 1
-                fc1 += (f"[s{si}_{k}]trim={bra:.4f}:{brb:.4f},setpts=PTS-STARTPTS,"
-                        f"fps=30,scale={W}:{H}:force_original_aspect_ratio=increase,"
+                nfr = max(1, round((tlb - tla) * 30))
+                timing = (f"trim={bra:.6f}:{bra+nfr/30+0.2:.6f},setpts=PTS-STARTPTS,"
+                          f"fps=30,tpad=stop_mode=clone:stop_duration=0.5,"
+                          f"trim=end_frame={nfr},setpts=N/30/TB," if exact_screen_frames else
+                          f"trim={bra:.4f}:{brb:.4f},setpts=PTS-STARTPTS,fps=30,")
+                fc1 += (f"[s{si}_{k}]{timing}scale={W}:{H}:force_original_aspect_ratio=increase,"
                         f"crop={W}:{H},setsar=1[t{j1}];")
                 parts1.append(f"[t{j1}]")
             if len(parts1) > 1:
                 fc1 += "".join(parts1) + f"concat=n={len(parts1)}:v=1:a=0[out]"
             else:
                 fc1 += f"{parts1[0]}null[out]"
+            if exact_screen_frames:
+                fc1 = fc1.removesuffix("[out]") + ",setpts=N/30/TB[out]"
             # Zwischenprodukt (vorgerenderte Screen-Laeufe). Im max-Modus
             # praktisch verlustfrei, damit die Bildschirmaufnahme — der
             # detailreichste Teil des Videos (Text, Terminal) — nicht schon vor
@@ -476,7 +505,10 @@ def main():
             _ipre = "veryfast" if mode == "max" else "ultrafast"
             cmd1 += ["-filter_complex", fc1, "-map", "[out]",
                      "-c:v", "libx264", "-preset", _ipre, "-crf", _icrf,
-                     "-pix_fmt", "yuv420p", rf]
+                     "-pix_fmt", "yuv420p"]
+            if exact_screen_frames:
+                cmd1 += ["-fps_mode", "passthrough", "-video_track_timescale", "30000"]
+            cmd1 += [rf]
             run(cmd1)
             run_files.append(rf)
             print(f"[sync]   Run {ri + 1}/{len(runs)} gerendert "
@@ -494,7 +526,9 @@ def main():
                if scale_base else f"[0:v]null[bg0];"))
         tracks = []
         for ri in range(len(runs)):
-            fc += (f"[{1 + ri}:v]setpts=PTS-STARTPTS+{runs[ri][0][0]:.3f}/TB[trs{ri}];")
+            placement = (f"{round(runs[ri][0][0]*30)}/30" if exact_screen_frames else
+                         f"{runs[ri][0][0]:.3f}")
+            fc += f"[{1 + ri}:v]setpts=PTS-STARTPTS+{placement}/TB[trs{ri}];"
             tracks.append(f"[trs{ri}]")
     else:
         # ohne Facecam-Kreis kein zweiter Zweig — ein unbenutzter [fcsrc]
@@ -529,8 +563,11 @@ def main():
             tracks.append(f"[trs{ri}]")
     prev = "bg0"
     for ri in range(len(runs)):
+        run_enable = (f"gte(t,{round(runs[ri][0][0]*30)}/30)*lt(t,{round(runs[ri][-1][1]*30)}/30)"
+                      if exact_screen_frames else
+                      f"between(t,{runs[ri][0][0]:.3f},{runs[ri][-1][1]:.3f})")
         fc += (f"[{prev}]{tracks[ri]}overlay=x=0:y=0:eof_action=pass:"
-               f"enable='between(t,{runs[ri][0][0]:.3f},{runs[ri][-1][1]:.3f})'[ov{ri}];")
+               f"enable='{run_enable}'[ov{ri}];")
         prev = f"ov{ri}"
     # Freie Slots: eigene Inputs (nach Maske+Schatten), Overlay UEBER den
     # Sync-Tracks aber UNTER dem Facecam-Kreis. fcsrc bleibt das reine Base
@@ -538,12 +575,14 @@ def main():
     slot_in0 = shadow_in + 1
     for j, sd in enumerate(slot_defs):
         dur = sd["b"] - sd["a"]
+        slot_enable = (f"gte(t,{sd['a']:.6f})*lt(t,{sd['b']:.6f})" if sd.get("hide_facecam")
+                       else f"between(t,{sd['a']:.3f},{sd['b']:.3f})")
         fc += (f"[{slot_in0 + j}:v]trim={sd['src_in']:.3f}:{sd['src_in'] + dur + 0.5:.3f},"
                f"setpts=PTS-STARTPTS,fps=30,"
                f"scale={W}:{H}:force_original_aspect_ratio=increase,"
                f"crop={W}:{H},setsar=1,setpts=PTS+{sd['a']:.3f}/TB[sl{j}];")
         fc += (f"[{prev}][sl{j}]overlay=x=0:y=0:eof_action=pass:"
-               f"enable='between(t,{sd['a']:.3f},{sd['b']:.3f})'[os{j}];")
+               f"enable='{slot_enable}'[os{j}];")
         prev = f"os{j}"
     if not pip_an:
         # Vollflaechig-Modus: kein Facecam-Kreis, kein Schatten. Der letzte
@@ -561,12 +600,13 @@ def main():
         fc += f"[fca]split={n}" + "".join(f"[fca{i}]" for i in range(n)) + ";"
         fc += f"[{shadow_in}:v]split={n}" + "".join(f"[shp{i}]" for i in range(n)) + ";"
         for i, (a, b) in enumerate(circle_win):
+            window_enable = facecam_enable(f"between(t,{a:.3f},{b:.3f})", slot_defs)
             off = (f"{K}*max(pow(max(0,1-(t-{a:.3f})/{tdur}),2),"
                    f"pow(max(0,1-({b:.3f}-t)/{tdur}),2))")
             fc += (f"[{prev}][shp{i}]overlay=x={sx}:y='{sy}+{off}':eof_action=pass:"
-                   f"enable='between(t,{a:.3f},{b:.3f})'[tsh{i}];")
+                   f"enable='{window_enable}'[tsh{i}];")
             fc += (f"[tsh{i}][fca{i}]overlay=x={px}:y='{py}+{off}':eof_action=pass:"
-                   f"enable='between(t,{a:.3f},{b:.3f})'"
+                   f"enable='{window_enable}'"
                    + (f"[tci{i}];" if i < n - 1 else "[vout]"))
             prev = f"tci{i}"
         print(f"[sync] Kreis-Transition aktiv: {n} Fenster, slide {tdur:.2f}s", flush=True)

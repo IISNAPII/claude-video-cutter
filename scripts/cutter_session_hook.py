@@ -8,10 +8,14 @@ schreibt zwei kleine Dateien ins Workdir:
   agent_status.json    {status, ts, session_id, aufgabe}
                        -> Cockpit-Badge ("arbeitet"/"fertig"), auch fuer
                           Hintergrund-Sessions anderer Projekte sichtbar.
-  claude_session.json  {session_id, ts}
-                       -> Reboot-Recovery: tmux ueberlebt keinen Neustart,
-                          der Cockpit-Server startet dann
-                          `claude --agent video-cutter --resume <id>`.
+  claude_session.json  {session_id, ts, hasUserTurn}
+                       -> Resume-Quelle: Cockpit startet beim Oeffnen
+                          `claude --agent video-cutter --resume <id>`, aber
+                          nur wenn hasUserTurn true ist (in der Session wurde
+                          geschrieben). Neue Session-ID -> false, erster
+                          Prompt -> true, Resume behaelt die ID und den Wert.
+                          Fehlt das Feld (Legacy), versucht das Cockpit den
+                          Resume wie frueher. (18.09.2026, Session-Lifecycle)
 
 WICHTIG: Der Hook ist in den PROJEKT-Settings des Video-Cutter-Verzeichnisses
 registriert und feuert damit fuer JEDE Claude-Session in diesem Projekt. Ohne
@@ -52,8 +56,21 @@ def main():
     now = time.strftime("%Y-%m-%d %H:%M:%S")
 
     if sid:
-        _write_atomic(os.path.join(wd, "claude_session.json"),
-                      {"session_id": sid, "ts": now})
+        ip = os.path.join(wd, "claude_session.json")
+        try:
+            with open(ip) as f:
+                prev = json.load(f) or {}
+        except Exception:
+            prev = {}
+        # gleiche ID = Fortsetzung (Wert behalten, None = Legacy unbekannt),
+        # neue ID = frische Session ohne Eingabe
+        has_turn = prev.get("hasUserTurn") if prev.get("session_id") == sid else False
+        if ev == "UserPromptSubmit":
+            has_turn = True
+        ident = {"session_id": sid, "ts": now}
+        if has_turn is not None:
+            ident["hasUserTurn"] = bool(has_turn)
+        _write_atomic(ip, ident)
 
     status, aufgabe = None, None
     if ev == "UserPromptSubmit":

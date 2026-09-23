@@ -48,6 +48,29 @@ def otsu_db(db):
     var = (w0 / total) * (w1 / total) * (m0 - m1) ** 2
     return float(mids[int(np.argmax(var))])
 
+def sprech_schwelle(x, sr, reserve_db=9.0):
+    """Sprech-/Stille-Schwelle fuer eine ganze Spur — GEMESSEN, nicht geschaetzt.
+
+    Der naheliegende Weg (Perzentil-Rauschteppich + 9 dB) bricht, sobald der
+    Ton nicht mehr von der Kamera kommt: Sebastians externes Ansteckmikro hat
+    einen Rauschteppich um -84 dB, floor+9 landet damit bei -75 dB und liegt
+    immer noch mitten im Rauschen. Der Onset-Detektor findet dann ueberall
+    "Sprache", saemtliche Kanten-Clamps greifen ins Leere — und zwar STILL,
+    ohne Fehlermeldung. Gefunden am 03.09.2026 im ersten Mikro-Lauf (sf0912),
+    wo Otsu bei -58,3 dB trennte statt bei -74,7.
+
+    Otsu trennt die beiden Verteilungen (Stille / Sprache) dort, wo sie
+    tatsaechlich liegen, unabhaengig vom Aufnahmegeraet.
+
+    Rueckgabe: (floor_wie_frueher, schwelle_db). Aufrufer, die bisher
+    "floor + 9" gerechnet haben, koennen floor_wie_frueher einsetzen und ihre
+    Rechnung unveraendert lassen.
+    """
+    _t, db, _hop = rms_db(np.asarray(x, dtype=np.float32), sr)
+    schwelle = otsu_db(db)
+    return schwelle - reserve_db, schwelle
+
+
 def _close_blips(mask, hop_s, max_gap_s=CLICK_S):
     m = mask.copy(); i, n = 0, len(m)
     max_len = int(max_gap_s / hop_s)

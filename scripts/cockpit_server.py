@@ -9,8 +9,15 @@ Cut-Entscheidungen + QA-Report und schreibt Nach-Cut-Overrides atomar zurueck.
 Nur Python-Stdlib + numpy/soundfile.
 """
 import base64
+from cutter_provider import TerminalManager, TerminalHandlerMixin, provider_name
+from cutter_broll_jobs import submit_marker
+from cutter_broll_jobs import enqueue as enqueue_broll
+from broll_auftrag import freeze_for_job as freeze_broll_job
+import fcntl
+from fractions import Fraction
 import json
 import os
+import pty
 import queue
 import re
 import shlex
@@ -19,20 +26,13 @@ import signal
 import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
-
-IS_WINDOWS = os.name == "nt"
-if not IS_WINDOWS:
-    import fcntl
-    import pty
-    import termios
-else:
-    # Windows: ConPTY via pywinpty (steht in requirements.txt, nur win32)
-    try:
-        import winpty  # type: ignore
-    except ImportError:  # pragma: no cover
-        winpty = None
+import sf_project
+import broll_contract
+import cutter_broll_session
+import cutter_session_lifecycle
 # ---------------------------------------------------------------------------
 # PATH-Reparatur (28.07.2026) — MUSS vor jedem subprocess-Aufruf stehen.
 # Das Obsidian-Plugin startet uns mit PATH=/usr/bin:/bin:/usr/sbin:/sbin.
@@ -94,7 +94,73 @@ CFG = {
 }
 
 # Lock, damit paralleles Lesen/Schreiben der Overrides sicher ist
-_OVR_LOCK = threading.Lock()
+_OVR_LOCK = threading.RLock()
+_SF_AUDIO_TASKS = {}
+_SF_AUDIO_LOCK = threading.Lock()
+
+
+def is_shortform():
+    return os.path.exists(os.path.join(CFG.get("workdir") or "", "sf_layout.json"))
+
+
+def sf_audio_state(settings, start=False):
+    """Resolve static gain without blocking ordinary state/status requests."""
+    audio = settings["layout"].get("audio") or {}
+    ovr = settings["overrides"]
+    manual = min(0, float((ovr.get("audio") or {}).get("gain_db", 0) or 0))
+    has_sfx = bool(audio.get("sfx_file") or audio.get("sfx_events"))
+    has_manual_overlap = any(i and c.get("jcutMode") == "manual" and float(c.get("jcut", 0) or 0) > .001
+                             for i, c in enumerate(ovr.get("timeline_clips", [])))
+    if audio.get("source_file") and not has_sfx:
+        from sf_source_preview import state as source_preview_state
+        return source_preview_state(CFG["workdir"], CFG.get("src_video") or "", audio, ovr, start,
+                                    playback_map=CFG.get("playback_map"))
+    prepared_mix = bool(audio.get("source_file")) or has_sfx or has_manual_overlap
+    if audio.get("mode") == "fixed" and not prepared_mix:
+        base = float(audio.get("gain_db", 0))
+        return {"status": "ready", "ready": True, "base_gain_db": base,
+                "manual_gain_db": manual, "total_gain_db": base + manual, "gain_db": base + manual}
+    src = CFG.get("src_video") or ""
+    try:
+        from sf_audio import voice_source_identity
+        identity = voice_source_identity(CFG["workdir"], src, audio)
+    except (OSError, ValueError) as error:
+        if audio.get("source_file"):
+            return {"status": "failed", "ready": False, "error": str(error)}
+        identity = [src]
+    sfx_source = None
+    if has_sfx:
+        try:
+            from sf_audio import sfx_sources
+            sfx_source = sfx_sources(CFG["workdir"], audio, ovr.get("timeline_clips", []))
+        except (OSError, ValueError, TypeError) as error:
+            return {"status": "failed", "ready": False, "error": str(error)}
+    key = sf_project.digest([identity, [{k: c.get(k) for k in ("id", "in", "out", "gain", "fade_in", "fade_out", "jcut", "jcutMode")}
+                                      for c in ovr.get("timeline_clips", [])], audio, sfx_source,
+                            manual if prepared_mix else None])
+    with _SF_AUDIO_LOCK:
+        task = _SF_AUDIO_TASKS.get(key)
+        if task is None and start:
+            task = {"status": "pending", "ready": False}
+            _SF_AUDIO_TASKS[key] = task
+            def calculate():
+                try:
+                    from sf_audio import prepare_audio
+                    result = prepare_audio(CFG["workdir"], src, ovr.get("timeline_clips", []), audio,
+                                           ovr.get("audio") if prepared_mix else {}, fps=60)
+                    with _SF_AUDIO_LOCK:
+                        _SF_AUDIO_TASKS[key] = dict(result, status="ready", ready=True, preview_mix=prepared_mix)
+                except Exception as error:
+                    with _SF_AUDIO_LOCK:
+                        _SF_AUDIO_TASKS[key] = {"status": "failed", "ready": False, "error": str(error)}
+            threading.Thread(target=calculate, daemon=True, name="sf-audio").start()
+        result = dict(task or {"status": "pending", "ready": False})
+    base = float(result.get("base_gain_db", 0))
+    result.update(base_gain_db=base, manual_gain_db=manual,
+                  total_gain_db=base + manual, gain_db=base + manual, key=key)
+    if prepared_mix and result.get("ready"):
+        result["mix_url"] = "/media/sf-mix/%s.wav" % key
+    return result
 # Lock um Render-Job-Check+Start (Doppel-POST-Race, Review-Befund #3)
 JOB_LOCK = threading.Lock()
 
@@ -146,6 +212,45 @@ def read_overrides():
 
 
 _BROLL_SYNC = {"info": None, "mtime": None, "error": None}
+_BROLL_READY = {}
+_BROLL_READY_LOCK = threading.Lock()
+
+
+def broll_file_ready(path):
+    """Probe each file revision once; an in-progress MP4 must not enter the player."""
+    path = os.path.abspath(path)
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return False
+    signature = (stat.st_mtime_ns, stat.st_size)
+    with _BROLL_READY_LOCK:
+        cached = _BROLL_READY.get(path)
+        if cached and cached[0] == signature:
+            return cached[1]
+        ready = False
+        if stat.st_size > 10000:
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-threads", "1", "-select_streams", "v:0",
+                     "-count_frames", "-show_entries",
+                     "stream=width,height,avg_frame_rate,nb_read_frames,duration:format=duration",
+                     "-of", "json", path], capture_output=True, text=True, timeout=15)
+                doc = json.loads(probe.stdout)
+                stream = doc["streams"][0]
+                duration = float(stream.get("duration") or doc.get("format", {}).get("duration") or 0)
+                fps = float(Fraction(stream.get("avg_frame_rate", "0")))
+                ready = (probe.returncode == 0 and not probe.stderr.strip()
+                         and (int(stream["width"]), int(stream["height"])) == (1920, 1080)
+                         and abs(fps - 30) < .001 and abs(duration - 5) < 1 / 30
+                         and int(stream.get("nb_read_frames", 0)) == 150)
+                # Reject a render that changed while ffprobe was reading it.
+                after = os.stat(path)
+                ready = ready and (after.st_mtime_ns, after.st_size) == signature
+            except (OSError, ValueError, TypeError, KeyError, IndexError, ZeroDivisionError, subprocess.TimeoutExpired):
+                ready = False
+        _BROLL_READY[path] = (signature, ready)
+        return ready
 
 
 def file_key(path):
@@ -390,86 +495,71 @@ def compute_peaks():
 # Ein Singleton-Terminal pro Server; SSE streamt Output (base64-Chunks),
 # POST /api/term/input schreibt Keystrokes. Ring-Buffer fuer Reconnect-Replay.
 # ---------------------------------------------------------------------------
-TERM = {
-    "fd": None,
-    "pid": None,
-    "wproc": None,  # Windows: winpty.PtyProcess
-    "buf": b"",
-    "subs": [],
-    "lock": threading.Lock(),
-    "alive": False,
-}
-TERM_BUF_MAX = 400_000
 TERM_AGENT = "video-cutter"
-
-# --------------------------------------------------------------------------
-# PERSISTENTE AGENT-SESSIONS (01.09.2026): claude laeuft NICHT mehr als
-# direktes PTY-Kind des Servers, sondern in einer detachten tmux-Session
-# pro Projekt ("cutter-<projekt>"). Das Server-PTY ist nur noch das FENSTER
-# (tmux attach). Stirbt der Server (PROJEKT WECHSELN), stirbt nur der
-# Attach-Client — die Session arbeitet im Hintergrund weiter (z.B. B-Roll
-# fertig bauen) und wird beim naechsten Oeffnen desselben Projekts wieder
-# angedockt. tmux ist zugleich das Register (tmux ls).
-# Reboot-Recovery: tmux ueberlebt keinen Neustart; der SessionStart-Hook
-# (cutter_session_hook.py, Projekt-Settings) schreibt die Claude-Session-ID
-# nach <workdir>/claude_session.json -> Neustart mit `--resume <id>`.
-# --------------------------------------------------------------------------
-
-def tmux_session_name(workdir=None):
-    import re as _re
-    base = os.path.basename(os.path.abspath(workdir or CFG["workdir"]))
-    return "cutter-" + _re.sub(r"[^A-Za-z0-9_-]", "_", base)
+_TERMINALS = {}
+_TERMINALS_LOCK = threading.Lock()
 
 
-def tmux_has_session(name):
-    tb = shutil.which("tmux")
-    if not tb:
-        return False
+# SESSION-LIFECYCLE (18.09.2026): Die Claude-Session (tmux cutter-*) endet, wenn
+# das Projekt zu ist (kein Cockpit mehr verbunden), und kommt per Resume zurueck,
+# sobald es wieder aufgeht. Vorher blieb jede Session ewig stehen (22 verwaiste
+# Sessions, 189 MCP-Prozesse). Entscheidung in cutter_session_lifecycle.py;
+# Player, Render und Overrides sind davon nicht betroffen.
+def _lifecycle_managers():
+    with _TERMINALS_LOCK:
+        cutters = [("cutter", manager) for manager in _TERMINALS.values()]
+    return cutters + [("broll:" + os.path.basename(key), manager)
+                      for key, manager in cutter_broll_session.managers().items()]
+
+
+_LIFECYCLE = cutter_session_lifecycle.Lifecycle(_lifecycle_managers, log=lambda text: print(text, flush=True))
+_RESTORE_LOCK = threading.Lock()
+
+
+def restore_broll_sessions():
+    """Projekt geht auf: B-Roll-Sessions, die beim Schliessen offen waren, im Hintergrund neu starten."""
+    def run():
+        if not _RESTORE_LOCK.acquire(blocking=False):
+            return
+        try:
+            cutter_broll_session.restore(CFG["workdir"], os.path.dirname(HERE),
+                                         log=lambda text: print(text, flush=True))
+        finally:
+            _RESTORE_LOCK.release()
+    threading.Thread(target=run, name="broll-restore", daemon=True).start()
+
+
+def terminals():
+    workdir = os.path.abspath(CFG["workdir"])
+    with _TERMINALS_LOCK:
+        if workdir not in _TERMINALS:
+            _TERMINALS[workdir] = TerminalManager(workdir, os.path.dirname(HERE), shortform=(os.path.exists(os.path.join(workdir, "sf_layout.json")) or os.path.exists(os.path.join(workdir, "captions_sf.json"))))
+        return _TERMINALS[workdir]
+
+
+def term_start(cols=120, rows=32, provider=None):
+    return terminals().start(provider, cols, rows)
+
+
+def term_write(data, provider=None):
+    return terminals().session(provider).write(data)
+
+
+def term_resize(cols, rows, provider=None):
+    return terminals().session(provider).resize(cols, rows)
+
+
+def term_kill():
+    # Server-Ende (PROJEKT WECHSELN, Strg+C): Claude-Sessions dieses Projekts
+    # beenden, Identity bleibt fuer den Resume. Arbeitet eine Session gerade,
+    # bleibt ihre tmux-Session stehen (Lifecycle-Guard) und wird spaeter geholt.
     try:
-        # "=" erzwingt exakten Namens-Match (sonst matcht tmux Praefixe:
-        # "cutter-v1" faende auch "cutter-v1b").
-        return subprocess.run([tb, "has-session", "-t", "=" + name],
-                              capture_output=True, timeout=5).returncode == 0
-    except Exception:
-        return False
-
-
-def tmux_ensure_session(name, cols, rows, claude_bin):
-    """Legt die detachte Projekt-Session an, falls sie fehlt. True = ok."""
-    tb = shutil.which("tmux")
-    if not tb or not claude_bin:
-        return False
-    if tmux_has_session(name):
-        return True
-    inner = "%s --agent %s" % (shlex.quote(claude_bin), TERM_AGENT)
-    sj = load_json(os.path.join(CFG["workdir"], "claude_session.json"), {}) or {}
-    rid = str(sj.get("session_id") or "").strip()
-    if rid and all(ch.isalnum() or ch in "-_" for ch in rid):
-        # Kontext der letzten Session zurueckholen; unbekannte ID -> frisch.
-        inner = ("%s --agent %s --resume %s || %s --agent %s"
-                 % (shlex.quote(claude_bin), TERM_AGENT, shlex.quote(rid),
-                    shlex.quote(claude_bin), TERM_AGENT))
-    try:
-        subprocess.run(
-            [tb, "new-session", "-d", "-s", name,
-             "-x", str(int(cols)), "-y", str(int(rows)),
-             "-c", os.path.dirname(HERE),
-             "-e", "CUTTER_WORKDIR=%s" % os.path.abspath(CFG["workdir"]),
-             "-e", "CUTTER_PROJECT=%s" % os.path.basename(os.path.abspath(CFG["workdir"])),
-             "-e", "TERM=xterm-256color",
-             "/bin/zsh", "-lc", inner],
-            check=True, capture_output=True, timeout=10)
-        # tmux-Statusleiste aus: im Cockpit soll es wie ein nacktes Claude
-        # aussehen, nicht wie ein Terminal-Multiplexer.
-        subprocess.run([tb, "set-option", "-t", "=" + name, "status", "off"],
-                       capture_output=True, timeout=5)
-        print("[cockpit] Agent-Session NEU: tmux %s%s"
-              % (name, " (resume %s)" % rid[:8] if rid else ""), flush=True)
-        return True
-    except Exception as e:  # noqa: BLE001
-        print("[cockpit] ⚠ tmux new-session fehlgeschlagen (%r) -> Direkt-PTY" % (e,),
-              flush=True)
-        return False
+        _LIFECYCLE.sweep(reason="server-ende", force=True)
+    except Exception as error:  # noqa: BLE001
+        print("[cockpit] Session-Ende fehlgeschlagen: %r" % (error,), flush=True)
+    for manager in _TERMINALS.values():
+        manager.close()
+    cutter_broll_session.close_all()
 
 
 def agent_sessions_info():
@@ -481,7 +571,7 @@ def agent_sessions_info():
     try:
         r = subprocess.run(
             [tb, "list-sessions", "-F",
-             "#{session_name}|#{session_created}|#{session_attached}"],
+             "#{session_name}|#{session_created}|#{session_attached}|#{@cutter-workdir}|#{@cutter-provider}"],
             capture_output=True, text=True, timeout=5)
     except Exception:
         return out
@@ -492,247 +582,46 @@ def agent_sessions_info():
         p = line.split("|")
         if not p or not p[0].startswith("cutter-"):
             continue
-        proj = p[0][len("cutter-"):]
-        wd = os.path.join(work_root, proj)
-        st = load_json(os.path.join(wd, "agent_status.json"), {}) or {}
+        provider = p[4] if len(p) > 4 and p[4] in ("claude", "codex") else "claude"
+        wd = p[3] if len(p) > 3 and os.path.isabs(p[3]) else os.path.join(work_root, p[0][len("cutter-"):])
+        proj = os.path.basename(wd)
+        st = load_json(os.path.join(wd, "codex_session.json" if provider == "codex" else "agent_status.json"), {}) or {}
         out.append({
-            "session": p[0], "projekt": proj,
+            "session": p[0], "projekt": proj, "provider": provider,
             "attached": len(p) > 2 and p[2] not in ("", "0"),
-            "aktuell": os.path.abspath(wd) == os.path.abspath(CFG["workdir"]),
-            "status": st.get("status"), "ts": st.get("ts"),
+            "aktuell": os.path.abspath(wd) == os.path.abspath(CFG["workdir"]) and provider == terminals().selected(),
+            "status": {"working": "arbeitet", "idle": "fertig", "ready": "bereit", "exited": "beendet"}.get(st.get("status"), st.get("status")), "ts": st.get("ts") or st.get("updatedAt"),
             "aufgabe": st.get("aufgabe"),
         })
     return out
 
 
 
-def _term_fail(msg):
-    """Fehlermeldung als Terminal-Output anzeigen statt still zu sterben."""
-    with TERM["lock"]:
-        TERM["buf"] = ("\r\n" + msg + "\r\n").encode("utf-8")
-        TERM["alive"] = False
 
+class Handler(TerminalHandlerMixin, BaseHTTPRequestHandler):
+    def terminal_manager(self):
+        job_id = (parse_qs(urlparse(self.path).query).get("broll_job") or [None])[0]
+        if job_id:
+            return cutter_broll_session.manager_for(CFG["workdir"], os.path.dirname(HERE), job_id)
+        return terminals()
 
-def _term_start_windows(cols=120, rows=32):
-    with TERM["lock"]:
-        if TERM["alive"]:
-            return
-        if winpty is None:
-            return _term_fail("pywinpty fehlt - bitte installieren: .venv312/Scripts/pip install pywinpty")
-        exe = shutil.which("claude")
-        if exe is None:
-            return _term_fail("claude nicht im PATH gefunden - ist Claude Code installiert?")
-        env = dict(os.environ)
-        env["TERM"] = "xterm-256color"
-        try:
-            proc = winpty.PtyProcess.spawn(
-                [exe, "--agent", TERM_AGENT],
-                cwd=os.path.dirname(HERE),
-                env=env,
-                dimensions=(int(rows), int(cols)),
-            )
-        except Exception as e:  # noqa: BLE001
-            return _term_fail("Claude-Start fehlgeschlagen: %s" % e)
-        TERM["wproc"] = proc
-        TERM["buf"] = b""
-        TERM["alive"] = True
-    threading.Thread(target=_term_reader_windows, daemon=True).start()
+    def serve_term_stream(self):
+        # Cockpit verbindet das Terminal = Projekt ist offen. Beim Haupt-Stream
+        # zusaetzlich die zuletzt offenen B-Roll-Sessions wieder hochfahren.
+        _LIFECYCLE.touch()
+        if not parse_qs(urlparse(self.path).query).get("broll_job"):
+            restore_broll_sessions()
+        return super().serve_term_stream()
 
-
-def _term_reader_windows():
-    proc = TERM["wproc"]
-    while True:
-        try:
-            chunk = proc.read(65536)  # str (ConPTY liefert Text)
-            data = chunk.encode("utf-8", "replace") if chunk else b""
-        except (EOFError, ConnectionAbortedError, OSError):
-            data = b""
-        if not data:
-            with TERM["lock"]:
-                TERM["alive"] = False
-                subs = list(TERM["subs"])
-            for q in subs:
-                q.put(None)
-            return
-        with TERM["lock"]:
-            TERM["buf"] = (TERM["buf"] + data)[-TERM_BUF_MAX:]
-            subs = list(TERM["subs"])
-        for q in subs:
-            q.put(data)
-
-
-def term_start(cols=120, rows=32):
-    if IS_WINDOWS:
-        return _term_start_windows(cols, rows)
-    with TERM["lock"]:
-        if TERM["alive"]:
-            return
-        # ABSOLUTEN Pfad aufloesen statt auf den Shell-PATH zu hoffen: eine
-        # nicht-interaktive Login-Shell liest .zprofile, aber NICHT .zshrc —
-        # dort steht bei npm-global-Installationen aber der Pfad zu `claude`.
-        claude_bin = shutil.which("claude")
-        tmux_bin = shutil.which("tmux")
-        sess = tmux_session_name()
-        # PERSISTENZ: Session detached anlegen (oder vorhandene weiternutzen),
-        # das PTY hier ist nur noch der Attach-Client. Faellt tmux aus,
-        # laeuft der alte Direkt-PTY-Pfad als Fallback (Session stirbt dann
-        # wieder mit dem Server — besser als gar kein Terminal).
-        use_tmux = bool(tmux_bin) and tmux_ensure_session(sess, cols, rows, claude_bin)
-        pid, fd = pty.fork()
-        if pid == 0:
-            # Kind: Attach-Client bzw. Fallback-claude im Login-Shell-Kontext
-            os.chdir(os.path.dirname(HERE))
-            os.environ["TERM"] = "xterm-256color"
-            # Hooks (cutter_session_hook.py) brauchen den Projekt-Kontext auch
-            # im Fallback-Pfad:
-            os.environ["CUTTER_WORKDIR"] = os.path.abspath(CFG["workdir"])
-            if use_tmux:
-                os.execvp(tmux_bin, [tmux_bin, "attach-session", "-t", "=" + sess])
-            if not claude_bin:
-                # Nicht still sterben — sonst bleibt die rechte Spalte leer und
-                # niemand weiss warum (genau so ist es am 31.07. passiert).
-                sys.stdout.write(
-                    "\r\n  claude wurde nicht gefunden.\r\n\r\n"
-                    "  PATH: %s\r\n\r\n"
-                    "  Erwartet z.B. unter ~/.npm-global/bin/claude.\r\n"
-                    "  Cockpit-Server mit vollem PATH neu starten.\r\n" %
-                    os.environ.get("PATH", ""))
-                sys.stdout.flush()
-                time.sleep(3600)
-                os._exit(1)
-            os.execvp("/bin/zsh", ["/bin/zsh", "-lc",
-                                   "%s --agent %s" % (shlex.quote(claude_bin), TERM_AGENT)])
-        TERM["fd"] = fd
-        TERM["pid"] = pid
-        TERM["buf"] = b""
-        TERM["alive"] = True
-        TERM["tmux"] = use_tmux
-    term_resize(cols, rows)
-    threading.Thread(target=_term_reader, daemon=True).start()
-
-
-def _term_reader():
-    fd = TERM["fd"]
-    while True:
-        try:
-            data = os.read(fd, 65536)
-        except OSError:
-            data = b""
-        if not data:
-            with TERM["lock"]:
-                TERM["alive"] = False
-                subs = list(TERM["subs"])
-            for q in subs:
-                q.put(None)
-            # Zombie sicher abraeumen: WNOHANG allein greift oft zu frueh
-            # (das Kind ist beim leeren read noch nicht als beendet vermerkt),
-            # dann bleiben <defunct>-Eintraege stehen.
-            for _try in range(20):
-                try:
-                    if os.waitpid(TERM["pid"], os.WNOHANG)[0]:
-                        break
-                except (OSError, TypeError):
-                    break
-                time.sleep(0.05)
-            return
-        with TERM["lock"]:
-            TERM["buf"] = (TERM["buf"] + data)[-TERM_BUF_MAX:]
-            subs = list(TERM["subs"])
-        for q in subs:
-            q.put(data)
-
-
-def term_resize(cols, rows):
-    if IS_WINDOWS:
-        proc = TERM["wproc"]
-        if proc is not None and TERM["alive"]:
-            try:
-                proc.setwinsize(int(rows), int(cols))
-            except Exception:  # noqa: BLE001
-                pass
-        return
-    if TERM["fd"] is None:
-        return
-    try:
-        fcntl.ioctl(TERM["fd"], termios.TIOCSWINSZ, struct.pack("HHHH", int(rows), int(cols), 0, 0))
-    except OSError:
-        pass
-
-
-def term_write(data):
-    if IS_WINDOWS:
-        proc = TERM["wproc"]
-        if proc is None or not TERM["alive"]:
-            return False
-        try:
-            proc.write(data.decode("utf-8", "replace"))
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-    if TERM["fd"] is None or not TERM["alive"]:
-        return False
-    try:
-        os.write(TERM["fd"], data)
-        return True
-    except OSError:
-        return False
-
-
-def term_kill():
-    # Beendet nur den ATTACH-Client (Fenster zu) — die tmux-Session und der
-    # Claude darin laufen weiter. Fuer das echte Beenden: term_kill_session().
-    with TERM["lock"]:
-        pid = TERM["pid"]
-        wproc = TERM["wproc"]
-        TERM["alive"] = False
-    if IS_WINDOWS:
-        if wproc is not None:
-            try:
-                wproc.terminate(force=True)
-            except Exception:  # noqa: BLE001
-                pass
-        return
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
-
-
-def term_kill_session():
-    """Beendet die persistente Agent-Session dieses Projekts WIRKLICH."""
-    term_kill()
-    tb = shutil.which("tmux")
-    sess = tmux_session_name()
-    if tb:
-        try:
-            subprocess.run([tb, "kill-session", "-t", "=" + sess],
-                           capture_output=True, timeout=5)
-            print("[cockpit] Agent-Session beendet: %s" % sess, flush=True)
-        except Exception:
-            pass
-    # BEWUSSTES Beenden -> die naechste Session soll FRISCH starten, nicht
-    # die eben gekillte resumen. claude_session.json ist nur fuer die
-    # Reboot-Recovery (Session starb OHNE Nutzer-Absicht) gedacht.
-    try:
-        os.unlink(os.path.join(CFG["workdir"], "claude_session.json"))
-    except OSError:
-        pass
-    # Status ehrlich machen (der SessionEnd-Hook feuert bei kill-session nicht
-    # zuverlaessig — SIGHUP kann Hooks abschneiden):
-    try:
-        p = os.path.join(CFG["workdir"], "agent_status.json")
-        st = load_json(p, {}) or {}
-        st.update({"status": "beendet", "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
-        with open(p + ".tmp", "w") as f:
-            json.dump(st, f, ensure_ascii=False)
-        os.replace(p + ".tmp", p)
-    except Exception:
-        pass
-
-
-class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def end_headers(self):
+        # Web Audio needs CORS when media uses the dedicated local range port.
+        origin = self.headers.get("Origin", "")
+        if re.fullmatch(r"http://(?:127\.0\.0\.1|localhost):\d+", origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        super().end_headers()
 
     # --- Logging leiser machen ---------------------------------------------
     def log_message(self, fmt, *args):
@@ -771,15 +660,72 @@ class Handler(BaseHTTPRequestHandler):
                 return self.serve_index()
             if route == "/favicon.ico":
                 return self._send_bytes(b"", "image/x-icon", HTTPStatus.NO_CONTENT)
+            if route.startswith("/firstframe/"):
+                return self.serve_first_frame(route)
+            if route.startswith("/medien/"):
+                return self.serve_medien(route)
+            if route == "/api/broll_starten_status":
+                return self.broll_starten(nur_status=True)
             if route == "/api/state":
                 return self.serve_state()
             if route == "/api/render_status":
                 return self.render_status()
+            if route == "/api/sf/audio":
+                return self._send_json(sf_audio_state(sf_project.load_settings(CFG["workdir"]), start=True))
+            if re.fullmatch(r"/media/sf-source/[0-9a-f]{64}\.wav", route):
+                from sf_source_preview import source_for_key
+                audio = sf_project.load_settings(CFG["workdir"])["layout"].get("audio") or {}
+                try:
+                    path = source_for_key(CFG["workdir"], CFG.get("src_video") or "", audio,
+                                          route.rsplit("/", 1)[-1][:-4])
+                except (OSError, ValueError, TypeError):
+                    path = None
+                return self.serve_media(path)
+            if re.fullmatch(r"/media/sf-source-video/[0-9a-f]{64}\.mp4", route):
+                from sf_source_preview import video_for_key
+                audio = sf_project.load_settings(CFG["workdir"])["layout"].get("audio") or {}
+                try:
+                    path = video_for_key(CFG["workdir"], CFG.get("src_video") or "", audio,
+                                         route.rsplit("/", 1)[-1][:-4], CFG.get("playback_map"))
+                except (OSError, ValueError, TypeError):
+                    path = None
+                return self.serve_media(path)
+            if re.fullmatch(r"/media/sf-mix/[0-9a-f]{64}\.wav", route):
+                key = route.rsplit("/", 1)[-1][:-4]
+                with _SF_AUDIO_LOCK:
+                    audio = dict(_SF_AUDIO_TASKS.get(key) or {})
+                return self.serve_media(audio.get("processed_path") if (audio.get("sfx_enabled") or audio.get("preview_mix")) and audio.get("ready") else None)
+            if route.startswith("/sf-text/") and re.fullmatch(r"/sf-text/[0-9a-f]{64}\.png", route):
+                path = os.path.join(CFG["workdir"], ".sf-text", route.rsplit("/", 1)[-1])
+                return self.serve_nach_typ(path)
+            if route.startswith("/sf-") and route.endswith(".js"):
+                name = os.path.basename(route)
+                path = os.path.join(HERE, "cockpit", name)
+                if os.path.isfile(path):
+                    with open(path, "rb") as stream:
+                        return self._send_bytes(stream.read(), "application/javascript", extra_headers={"Cache-Control": "no-store"})
+            if re.fullmatch(r"/media/export/[0-9a-f]+\.mp4", route):
+                import cutter_render_jobs
+                job = cutter_render_jobs.read_status(CFG["workdir"], route.rsplit("/", 1)[-1][:-4])
+                path = job.get("output") or job.get("export")
+                return self.serve_media(path if job.get("status") == "done" else None)
+            if route.startswith("/media/sf-hook/"):
+                key = route.rsplit("/", 1)[-1]
+                hook = sf_project.load_settings(CFG["workdir"])["layout"].get("hook") or {}
+                return self.serve_nach_typ((hook.get(key) or {}).get("file"))
             if route == "/api/joint_audio":
                 return self.serve_joint_audio(qs)
             if route == "/api/peaks":
                 return self.serve_peaks()
             if route == "/media/proxy.mp4":
+                if is_shortform():
+                    from cutter_render_jobs import latest_output
+                    rendered = latest_output(CFG["workdir"], mode="proxy")
+                    if rendered:
+                        return self.serve_media(rendered)
+                    current = os.path.join(CFG["workdir"], "proxy.mp4")
+                    if os.path.exists(current):
+                        return self.serve_media(current)
                 return self.serve_media(CFG.get("proxy_path"))
             if route == "/media/source.mp4":
                 return self.serve_media(CFG.get("src_video"))
@@ -791,10 +737,11 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/media/broll.mp4":
                 info = broll_sync_info()
                 return self.serve_media(info["file"] if info else None)
-            if route.startswith("/media/broll_key_") and route.endswith(".mp4"):
+            if route.startswith("/media/broll_key_"):
                 # Datei-Schluessel statt Listen-Index: bleibt gueltig, egal ob
                 # Slots geloescht, verschoben oder noch nicht gespeichert sind.
-                key = route[len("/media/broll_key_"):-len(".mp4")]
+                # Endung ist nur Dekoration (Standbild-Slots seit 03.09.).
+                key = os.path.splitext(route[len("/media/broll_key_"):])[0]
                 treffer = None
                 for b in read_overrides().get("broll", []):
                     f = b.get("file")
@@ -806,7 +753,7 @@ class Handler(BaseHTTPRequestHandler):
                         if file_key(q["file"]) == key:
                             treffer = q["file"]
                             break
-                return self.serve_media(treffer if treffer and os.path.exists(treffer) else None)
+                return self.serve_nach_typ(treffer if treffer and os.path.exists(treffer) else None)
             if route.startswith("/media/broll_slotfile_") and route.endswith(".mp4"):
                 # Slot-Datei nach Index in der DEDUPLIZIERTEN Datei-Liste —
                 # stabil auch fuer frisch gesplittete, ungespeicherte Slots.
@@ -839,11 +786,20 @@ class Handler(BaseHTTPRequestHandler):
                 srcs = (info or {}).get("sources") or []
                 f = srcs[k]["file"] if 0 <= k < len(srcs) else None
                 return self.serve_media(f)
+            if route in ("/api/term/state", "/api/agent_status", "/api/broll_session"):
+                _LIFECYCLE.touch()      # Cockpit-Seite pollt diese Routen = Projekt offen
+            if route == "/api/broll_session":
+                if not self._term_origin_ok():
+                    return self._send_json({"error": "forbidden"}, 403)
+                job_id = (parse_qs(parsed.query).get("job_id") or [None])[0]
+                return self._send_json(cutter_broll_session.session_state(CFG["workdir"], job_id))
+            if route == "/api/term/state":
+                return self.terminal_state()
             if route == "/api/term/stream":
                 return self.serve_term_stream()
             if route == "/api/agent_status":
                 return self._send_json({"sessions": agent_sessions_info(),
-                                        "projekt": os.path.basename(os.path.abspath(CFG["workdir"]))})
+                                        "projekt": CFG.get("title") or os.path.basename(os.path.abspath(CFG["workdir"]))})
             if route.startswith("/vendor/"):
                 return self.serve_vendor(route)
             self._send_json({"error": "not found", "path": route}, HTTPStatus.NOT_FOUND)
@@ -861,13 +817,44 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         route = parsed.path
+        if route.startswith("/api/term/"):
+            _LIFECYCLE.touch()
         try:
+            if route == "/api/sf/save":
+                return self.save_sf_settings()
+            if route == "/api/sf/audio":
+                self._read_post_json()
+                return self._send_json(sf_audio_state(sf_project.load_settings(CFG["workdir"]), start=True))
+            if route == "/api/sf/text-preview":
+                return self.sf_text_preview()
+            if route == "/api/export_open":
+                return self.export_open()
             if route == "/api/overrides":
                 return self.save_overrides()
+            if route == "/api/captions":
+                return self.save_captions()
+            if route == "/api/broll_auftrag":
+                return self.broll_auftrag()
+            if route == "/api/broll_import":
+                return self.broll_import()
+            if route == "/api/broll_starten":
+                return self.broll_starten()
+            if route == "/api/first_frame":
+                return self.set_first_frame()
+            if route == "/api/medien_upload":
+                return self.medien_upload()
+            if route == "/api/captions_sync":
+                return self.captions_sync()
             if route == "/api/broll_request":
                 return self.broll_request()
             if route == "/api/rerender":
                 return self.rerender()
+            if route == "/api/export":
+                return self.export_final()
+            if route in ("/api/term/provider", "/api/term/kill_session") and "broll_job" in parse_qs(parsed.query):
+                return self._send_json({"error": "Die B-Roll-Session behält ihren Anbieter und Verlauf."}, 409)
+            if route == "/api/term/provider":
+                return self.terminal_select()
             if route == "/api/term/input":
                 return self.term_input()
             if route == "/api/term/resize":
@@ -887,18 +874,86 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def save_sf_settings(self):
+        if not is_shortform():
+            return self._send_json({"error": "Kein Shortform-Projekt"}, HTTPStatus.BAD_REQUEST)
+        payload = self._read_post_json()
+        try:
+            with _OVR_LOCK:
+                saved = sf_project.save_settings(CFG["workdir"], payload)
+        except sf_project.RevisionConflict as error:
+            return self._send_json({"ok": False, "conflict": True, "error": str(error)}, HTTPStatus.CONFLICT)
+        except ValueError as error:
+            return self._send_json({"ok": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
+        return self._send_json(dict(saved, ok=True, resolvedAudio=sf_audio_state(saved, start=True)))
+
+    def sf_text_preview(self):
+        request = self._read_post_json()
+        settings = sf_project.load_settings(CFG["workdir"])
+        kind = request.get("kind", "caption")
+        layer = request.get("layer") if isinstance(request.get("layer"), dict) else request
+        layout = request.get("layout") or settings["layout"]
+        if request.get("style"):
+            layer = dict(layer, style=request["style"])
+        key = sf_project.digest(["sf-text-v1", kind, layer, layout.get("caption")])
+        directory = os.path.join(CFG["workdir"], ".sf-text")
+        os.makedirs(directory, exist_ok=True)
+        target = os.path.join(directory, key + ".png")
+        meta_path = os.path.join(directory, key + ".json")
+        meta = load_json(meta_path, None)
+        if meta is None or not os.path.exists(target):
+            bitmap = sf_project.text_bitmap(kind, layer, layout)
+            box = bitmap.getbbox() or (0, 0, 1, 1)
+            import uuid
+            tmp = os.path.join(directory, key + "." + uuid.uuid4().hex + ".png")
+            bitmap.crop(box).save(tmp)
+            os.replace(tmp, target)
+            meta = {"width": box[2]-box[0], "height": box[3]-box[1],
+                    "contentBounds": {"x": box[0], "y": box[1], "width": box[2]-box[0], "height": box[3]-box[1]}}
+            sf_project.atomic_json(meta_path, meta)
+        return self._send_json(dict(meta, url="/sf-text/" + key + ".png"))
+
+    def export_open(self):
+        import cutter_render_jobs
+        request = self._read_post_json()
+        job = cutter_render_jobs.read_status(CFG["workdir"], request.get("job_id"))
+        path = job.get("output") or job.get("export")
+        if job.get("status") != "done" or not path:
+            return self._send_json({"error": "Dieser Export ist noch nicht fertig"}, HTTPStatus.CONFLICT)
+        if request.get("action") not in ("open", "finder"):
+            return self._send_json({"error": "Unbekannte Aktion"}, HTTPStatus.BAD_REQUEST)
+        args = ["open"] + (["-R"] if request["action"] == "finder" else []) + [path]
+        result = subprocess.run(args, capture_output=True, text=True)
+        return self._send_json({"ok": result.returncode == 0, "file": path})
+
+    def start_sf_render(self, mode, request=None):
+        import cutter_render_jobs
+        request = request or {}
+        if not CFG.get("src_video"):
+            return self._send_json({"error": "Quellvideo fehlt"}, HTTPStatus.BAD_REQUEST)
+        with _OVR_LOCK:
+            settings = sf_project.load_settings(CFG["workdir"])
+            if request.get("revision") and request["revision"] != settings["revision"]:
+                return self._send_json({"error": "Der Schnitt wurde inzwischen geändert. Bitte erneut exportieren.",
+                                        "conflict": True}, HTTPStatus.CONFLICT)
+            job = cutter_render_jobs.enqueue(CFG["workdir"], CFG["src_video"], mode=mode, snapshot=settings)
+        return self._send_json(dict(job, ziel=job.get("output") or job.get("export")))
+
     # ---------- B-Roll-Auftrag (T-Marker) ----------
     def broll_request(self):
         """Sebastian markiert mit T einen Bereich -> Briefing bauen, ablegen und
         als Auftrag in die laufende Claude-Terminal-Session schreiben.
         Fire-and-forget: kehrt sofort zurueck, er arbeitet weiter."""
         body = self._read_post_json()
+        provider = self.request_provider(body)
         try:
             a = float(body.get("start")); b = float(body.get("end"))
         except (TypeError, ValueError):
             return self._send_json({"error": "start/end fehlen"}, HTTPStatus.BAD_REQUEST)
         if b <= a:
             return self._send_json({"error": "leerer Bereich"}, HTTPStatus.BAD_REQUEST)
+        if is_shortform():
+            return self.production_broll_start(body, selected_range=[a, b])
         wunsch = (body.get("prompt") or "").strip()
 
         ovr = read_overrides()
@@ -915,7 +970,8 @@ class Handler(BaseHTTPRequestHandler):
         # Render (apply_jcut_edges inkl. Echo-Clamp) die BILD-Achse:
         # Output t im Clip i -> raw = v_in + (t − v_start).
         _axis = [{"in": float(c["in"]), "out": float(c["out"]),
-                  "jcut": max(0.0, float(c.get("jcut", 0) or 0))}
+                  "jcut": max(0.0, float(c.get("jcut", 0) or 0)),
+                  **({"jcutMode": "manual"} if c.get("jcutMode") == "manual" else {})}
                  for c in clips if float(c["out"]) - float(c["in"]) >= 0.04]
         if _axis:
             _axis[0]["jcut"] = 0.0
@@ -932,11 +988,11 @@ class Handler(BaseHTTPRequestHandler):
         def raw_ranges(oa, ob):
             res = []
             for s in _axis:
-                vdur = s["v_out"] - s["v_in"]
+                vdur = s.get("v_duration", s["v_out"] - s["v_in"])
                 x, y = max(oa, s["v_start"]), min(ob, s["v_start"] + vdur)
                 if y > x:
-                    res.append((s["v_in"] + (x - s["v_start"]),
-                                s["v_in"] + (y - s["v_start"])))
+                    res.append((min(s["v_out"], s["v_in"] + (x - s["v_start"])),
+                                min(s["v_out"], s["v_in"] + (y - s["v_start"]))))
             return res
 
         def out_to_raw(t):
@@ -961,14 +1017,15 @@ class Handler(BaseHTTPRequestHandler):
                     if sl.get("kind") != "screen":
                         return "Grafik '%s'" % sl.get("name", "?")
                     best = best or "Bildschirmaufnahme"
-            return best or "Talking-Head (Sprecher fullscreen)"
+            return best or "Talking-Head (Sebastian fullscreen)"
 
-        total = sum(s["v_out"] - s["v_in"] for s in _axis)   # echte Output-Laenge (mit jcuts)
+        total = sum(s.get("v_duration", s["v_out"] - s["v_in"]) for s in _axis)   # echte Output-Laenge (mit jcuts)
         tc = lambda t: "%d:%02d" % (int(t // 60), int(t % 60))
         brief = {
             "typ": "broll_auftrag",
+            "provider": provider,
             "erstellt": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "projekt": os.path.basename(os.path.abspath(CFG["workdir"])),
+            "projekt": CFG.get("title") or os.path.basename(os.path.abspath(CFG["workdir"])),
             "workdir": os.path.abspath(CFG["workdir"]),
             "quellvideo": CFG.get("src_video"),
             "zielbereich": {
@@ -1002,26 +1059,22 @@ class Handler(BaseHTTPRequestHandler):
                 "Uebergang zum Davor/Danach sauber gestalten."
             ) % (a, out_to_raw(a)),
         }
-        reqdir = os.path.join(CFG["workdir"], "broll_requests")
-        os.makedirs(reqdir, exist_ok=True)
-        path = os.path.join(reqdir, "req-%s.json" % time.strftime("%Y%m%d-%H%M%S"))
-        with open(path, "w") as f:
-            json.dump(brief, f, ensure_ascii=False, indent=1)
-
-        kurz = (brief["gesagt_im_bereich"] or "")[:110].replace('"', "'")
-        line = ("[B-ROLL-AUFTRAG] Lies %s und baue die dort beschriebene Grafik-B-Roll "
-                "(Bereich %s-%s, %.1fs). Gesagt wird dort: \"%s\". %s"
-                "Szene bauen, rendern, als freien Slot eintragen, dann kurz Bescheid geben."
-                % (path, tc(a), tc(b), b - a, kurz,
-                   ("Wunsch: %s. " % wunsch) if wunsch else ""))
-        sent = term_write(line.encode("utf-8") + b"\r")
-        print("[cockpit] B-Roll-Auftrag -> %s (Terminal: %s)"
-              % (os.path.basename(path), "ok" if sent else "nicht erreichbar"), flush=True)
-        self._send_json({"ok": True, "request": path, "terminal": bool(sent)})
+        def send_marker(path):
+            kurz = (brief["gesagt_im_bereich"] or "")[:110].replace('"', "'")
+            line = ("[B-ROLL-AUFTRAG] Lies %s und baue die dort beschriebene Grafik-B-Roll "
+                    "(Bereich %s-%s, %.1fs). Gesagt wird dort: \"%s\". %s"
+                    "Szene bauen, rendern, als freien Slot eintragen, dann kurz Bescheid geben."
+                    % (path, tc(a), tc(b), b - a, kurz,
+                       ("Wunsch: %s. " % wunsch) if wunsch else ""))
+            return term_write(line.encode("utf-8") + b"\r", provider)
+        path, sent, duplicate = submit_marker(CFG["workdir"], provider, body.get("requestId"), brief, send_marker)
+        self._send_json({"ok": True, "request": path, "terminal": bool(sent), "provider": provider, "duplicate": duplicate})
 
     # --- Claude-Terminal + Vendor ------------------------------------------
     VENDOR_FILES = {
         "xterm.js": "application/javascript; charset=utf-8",
+        "provider-terminal.js": "application/javascript; charset=utf-8",
+        "broll-terminal.js": "application/javascript; charset=utf-8",
         "xterm.css": "text/css; charset=utf-8",
         "addon-fit.js": "application/javascript; charset=utf-8",
     }
@@ -1050,84 +1103,6 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(ln) or b"{}")
         except (ValueError, UnicodeDecodeError):
             return {}
-
-    def serve_term_stream(self):
-        if not self._term_origin_ok():
-            return self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
-        term_start()
-        q = queue.Queue()
-        with TERM["lock"]:
-            replay = TERM["buf"]
-            TERM["subs"].append(q)
-        try:
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.end_headers()
-
-            def emit(chunk):
-                payload = base64.b64encode(chunk).decode("ascii")
-                self.wfile.write(("data: %s\n\n" % payload).encode("ascii"))
-                self.wfile.flush()
-
-            if replay:
-                emit(replay)
-            while True:
-                try:
-                    data = q.get(timeout=15)
-                except queue.Empty:
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
-                    continue
-                if data is None:
-                    self.wfile.write(b"event: exit\ndata: 1\n\n")
-                    self.wfile.flush()
-                    return
-                emit(data)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
-        finally:
-            self.close_connection = True
-            with TERM["lock"]:
-                if q in TERM["subs"]:
-                    TERM["subs"].remove(q)
-
-    def term_input(self):
-        if not self._term_origin_ok():
-            return self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
-        body = self._read_post_json()
-        try:
-            data = base64.b64decode(body.get("data", ""))
-        except (ValueError, TypeError):
-            data = b""
-        self._send_json({"ok": term_write(data)})
-
-    def term_resize_route(self):
-        if not self._term_origin_ok():
-            return self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
-        body = self._read_post_json()
-        term_resize(body.get("cols", 120), body.get("rows", 32))
-        self._send_json({"ok": True})
-
-    def term_restart(self):
-        # Mit tmux: nur das FENSTER neu verbinden (Session laeuft weiter).
-        if not self._term_origin_ok():
-            return self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
-        term_kill()
-        time.sleep(0.4)
-        term_start()
-        self._send_json({"ok": True})
-
-    def term_kill_session_route(self):
-        # Beendet die PERSISTENTE Agent-Session (tmux + Claude) wirklich und
-        # startet ein frisches Terminal-Fenster mit neuer Session.
-        if not self._term_origin_ok():
-            return self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
-        term_kill_session()
-        time.sleep(0.6)
-        term_start()
-        self._send_json({"ok": True})
 
     # --- Routen-Implementierung -------------------------------------------
     def serve_index(self):
@@ -1170,6 +1145,7 @@ class Handler(BaseHTTPRequestHandler):
                     for q in bs_info["sources"]
                 ]
         state = {
+            "terminalProvider": terminals().state(),
             "words": words,
             "decisions": decisions,
             "segments": segments,
@@ -1191,6 +1167,10 @@ class Handler(BaseHTTPRequestHandler):
             "audioAligned": bool(CFG.get("audio_aligned")),
             "mediaBase": mb,
             "playbackProxy": bool(CFG.get("playback_map")),
+            # A B-roll-only proxy must not enable the main-video seek strategy.
+            "mainPlaybackProxy": bool(CFG.get("src_video") and
+                                      os.path.abspath(CFG["src_video"]) in
+                                      (CFG.get("playback_map") or {})),
             # PAUSEN-KARTE (01.09.): waveform-gemessene Sprechpausen fuer den
             # L-Cut-Silence-Clamp im Player (pause_map.py). Ohne Karte klemmt
             # der Player J-Cuts NICHT an die Stille — Banner weist darauf hin.
@@ -1198,6 +1178,18 @@ class Handler(BaseHTTPRequestHandler):
             # PERSISTENTE AGENT-SESSIONS (01.09.): laufende cutter-* Sessions
             # aller Projekte (Badge + Hintergrund-Anzeige im Frontend).
             "agentSessions": agent_sessions_info(),
+            # SHORTFORM-MODUS (01.09.): Der fruehere SF-Fork (cockpit_sf) ist
+            # in den Haupt-Cockpit gewandert. Liegen SF-Artefakte im Workdir,
+            # aktiviert das Frontend Caption-Spur, Reel-Split-Preview und die
+            # rebuild_sf-Render-Weiche — Longform-Projekte bleiben unberuehrt.
+            "sfMode": (os.path.exists(os.path.join(CFG["workdir"], "sf_layout.json"))
+                       or os.path.exists(os.path.join(CFG["workdir"], "captions_sf.json"))),
+            "captions": load_json(os.path.join(CFG["workdir"], "captions_sf.json"), None),
+            # First-Frame-Varianten (03.09.): Bilder in <workdir>/firstframe/,
+            # Sebastian waehlt eine per Klick auf dem Hook-Clip.
+            "firstFrames": self.first_frame_kandidaten(),
+            "captionsMtime": (os.path.getmtime(os.path.join(CFG["workdir"], "captions_sf.json"))
+                              if os.path.exists(os.path.join(CFG["workdir"], "captions_sf.json")) else None),
             "brollSync": bs_info,
             "brollUrl": ((mb + "/media/broll.mp4") if bs_info else None),
             # Selbstdiagnose fuers Frontend-Banner: was fehlt, wenn etwas fehlt
@@ -1214,6 +1206,14 @@ class Handler(BaseHTTPRequestHandler):
                 "qa": CFG["qa_path"],
             },
         }
+        if is_shortform():
+            import cutter_render_jobs
+            settings = sf_project.load_settings(CFG["workdir"])
+            state.update(overrides=settings["overrides"], captions=settings["captions"],
+                         sfLayout=settings["layout"], projectRevision=settings["revision"],
+                         resolvedAudio=sf_audio_state(settings, start=True),
+                         renderJob=cutter_render_jobs.read_status(CFG["workdir"]),
+                         sfTextLayers=sf_project.legacy_layers(settings["layout"], settings["overrides"].get("timeline_clips", [])))
         self._send_json(state)
 
     def serve_joint_audio(self, qs):
@@ -1350,6 +1350,366 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    MEDIEN_MAX = 400 * 1024 * 1024      # 400 MB je Datei
+    # First-Frame-Bilder: kein GIF, kein Video — das Hook-Overlay ist ein Standbild
+    FF_TYPEN = {".png": "image/png", ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg", ".webp": "image/webp"}
+    MEDIEN_TYPEN = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".webp": "image/webp", ".gif": "image/gif",
+                    ".mp4": "video/mp4", ".mov": "video/quicktime",
+                    ".m4v": "video/mp4", ".webm": "video/webm"}
+
+    def medien_upload(self):
+        """Eigene Bilder/Videos ins Projekt holen (03.09.).
+
+        Sebastian will eigenes Material einsetzen koennen, etwa ein selbst
+        gebautes First-Frame-Bild. Die Datei landet in <workdir>/medien/ und
+        wird von dort ausgeliefert; die Timeline bekommt nur den Pfad.
+        """
+        # ZIEL (04.09.): Seit dem Finder-Drop kann derselbe Upload zweierlei
+        # bedeuten — ein Medium auf die Timeline oder ein First-Frame-Bild fuer
+        # den Visual Hook. Der Header sagt welches; ohne Header bleibt alles
+        # wie vorher (medien/), damit der Knopf-Import unveraendert laeuft.
+        ziel_art = (self.headers.get("X-Ziel") or "medien").strip().lower()
+        if ziel_art not in ("medien", "firstframe"):
+            ziel_art = "medien"
+        erlaubt = self.MEDIEN_TYPEN if ziel_art == "medien" else self.FF_TYPEN
+        name = os.path.basename(self.headers.get("X-Dateiname", "") or "")
+        ext = os.path.splitext(name)[1].lower()
+        if not name or ext not in erlaubt:
+            return self._send_json(
+                {"error": "Dateityp nicht unterstuetzt: %r (erlaubt: %s)"
+                          % (name, ", ".join(sorted(erlaubt)))},
+                HTTPStatus.BAD_REQUEST)
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return self._send_json({"error": "leere Datei"}, HTTPStatus.BAD_REQUEST)
+        if length > self.MEDIEN_MAX:
+            return self._send_json(
+                {"error": "zu gross: %.0f MB (max %d MB)"
+                          % (length / 1048576.0, self.MEDIEN_MAX // 1048576)},
+                HTTPStatus.BAD_REQUEST)
+        d = os.path.join(CFG["workdir"], ziel_art)
+        os.makedirs(d, exist_ok=True)
+        stamm, endung = os.path.splitext(name)
+        ziel = os.path.join(d, name)
+        n = 2
+        while os.path.exists(ziel):          # nie ueberschreiben
+            ziel = os.path.join(d, f"{stamm}-{n}{endung}")
+            n += 1
+        tmp = ziel + ".part"
+        rest = length
+        with open(tmp, "wb") as f:
+            while rest > 0:
+                block = self.rfile.read(min(1024 * 1024, rest))
+                if not block:
+                    break
+                f.write(block)
+                rest -= len(block)
+        if rest > 0:
+            os.remove(tmp)
+            return self._send_json({"error": "Upload abgebrochen"},
+                                   HTTPStatus.INTERNAL_SERVER_ERROR)
+        os.replace(tmp, ziel)
+        print("[cockpit] %s importiert: %s (%.1f MB)"
+              % (ziel_art, os.path.basename(ziel), length / 1048576.0), flush=True)
+        antwort = {"ok": True, "name": os.path.basename(ziel), "file": ziel,
+                   "url": "/%s/%s" % (ziel_art, os.path.basename(ziel)),
+                   "bytes": length, "ziel": ziel_art}
+        if ziel_art == "firstframe":
+            antwort["kandidaten"] = self.first_frame_kandidaten()
+        return self._send_json(antwort)
+
+    def serve_nach_typ(self, p):
+        """Video ueber serve_media (Range noetig), Bilder direkt.
+
+        Slots koennen seit 03.09. auch Standbilder sein (importierte Medien).
+        serve_media wuerde sie als video/mp4 ausliefern — der Browser zeigt
+        dann nichts an.
+        """
+        if not p or not os.path.exists(p):
+            return self._send_json({"error": "nicht gefunden"}, HTTPStatus.NOT_FOUND)
+        ext = os.path.splitext(p)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+            return self.serve_media(p)
+        with open(p, "rb") as f:
+            data = f.read()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", self.MEDIEN_TYPEN.get(ext, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_medien(self, route):
+        name = os.path.basename(route[len("/medien/"):])
+        return self.serve_nach_typ(os.path.join(CFG["workdir"], "medien", name))
+
+    def first_frame_kandidaten(self):
+        """Bilder in <workdir>/firstframe/ = Auswahl fuer den Visual Hook."""
+        d = os.path.join(CFG["workdir"], "firstframe")
+        if not os.path.isdir(d):
+            return []
+        out = []
+        aktiv = os.path.abspath(
+            ((load_json(os.path.join(CFG["workdir"], "sf_layout.json"), {})
+              .get("hook") or {}).get("hf") or {}).get("file") or "")
+        for f in sorted(os.listdir(d)):
+            if f.startswith(".") or os.path.splitext(f)[1].lower() not in (
+                    ".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            p = os.path.join(d, f)
+            out.append({"name": f, "file": os.path.abspath(p), "url": "/firstframe/" + f,
+                        "aktiv": os.path.abspath(p) == aktiv,
+                        "size": os.path.getsize(p)})
+        return out
+
+    def serve_first_frame(self, route):
+        name = os.path.basename(route[len("/firstframe/"):])
+        p = os.path.join(CFG["workdir"], "firstframe", name)
+        if not os.path.exists(p):
+            return self._send_json({"error": "nicht gefunden"}, HTTPStatus.NOT_FOUND)
+        typ = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+               "webp": "image/webp"}.get(name.rsplit(".", 1)[-1].lower(), "application/octet-stream")
+        with open(p, "rb") as f:
+            data = f.read()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", typ)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def set_first_frame(self):
+        """Sebastian waehlt eine Variante -> sf_layout.hook.hf.file.
+
+        Das Bild liegt als Overlay ueber dem Hook-Clip (so baut rebuild_sf es
+        schon). Die Auswahl aendert nur den Dateipfad, nie die Geometrie.
+        """
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            req = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            return self._send_json({"error": "bad json: %s" % e}, HTTPStatus.BAD_REQUEST)
+        name = os.path.basename(str(req.get("name") or ""))
+        p = os.path.join(CFG["workdir"], "firstframe", name)
+        if not name or not os.path.exists(p):
+            return self._send_json({"error": "Bild nicht gefunden: %r" % name},
+                                   HTTPStatus.BAD_REQUEST)
+        lay_p = os.path.join(CFG["workdir"], "sf_layout.json")
+        lay = load_json(lay_p, {})
+        lay.setdefault("hook", {}).setdefault("hf", {})["file"] = os.path.abspath(p)
+        tmp = lay_p + ".part"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(lay, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, lay_p)
+        print("[cockpit] First Frame gesetzt: %s" % name, flush=True)
+        return self._send_json({"ok": True, "kandidaten": self.first_frame_kandidaten()})
+
+    def production_broll_start(self, body, selected_range=None):
+        """Freeze the reviewed cut before launching the dedicated production role."""
+        if not self._term_origin_ok():
+            return self._send_json({"ok": False, "error": "forbidden"}, HTTPStatus.FORBIDDEN)
+        if not body.get("revision"):
+            return self._send_json({"ok": False, "error": "Projektversion fehlt. Bitte zuerst den Schnitt speichern."}, HTTPStatus.BAD_REQUEST)
+        try:
+            request = broll_contract.prepare_request(
+                CFG["workdir"], CFG["src_video"], selected_range=selected_range,
+                expected_revision=body.get("revision"), creative_request=body.get("prompt") or "")
+            job = enqueue_broll(CFG["workdir"], os.path.dirname(HERE),
+                                self.request_provider(body), request=request)
+            return self._send_json({"ok": True, "contract_version": 2, "job": job,
+                                    "provider": job["provider"], "gesendet": job.get("status") in ("queued", "running", "done")})
+        except sf_project.RevisionConflict as error:
+            return self._send_json({"ok": False, "conflict": True, "error": str(error)}, HTTPStatus.CONFLICT)
+        except (ValueError, OSError) as error:
+            return self._send_json({"ok": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+    def broll_import(self):
+        if not self._term_origin_ok() or not is_shortform():
+            return self._send_json({"ok": False, "error": "forbidden"}, HTTPStatus.FORBIDDEN)
+        body = self._read_post_json()
+        if not body.get("revision"):
+            return self._send_json({"ok": False, "error": "Projektversion fehlt"}, HTTPStatus.BAD_REQUEST)
+        try:
+            settings = broll_contract.import_result(CFG["workdir"], body.get("job_id"), body["revision"])
+            return self._send_json(dict(settings, ok=True, contract_version=2))
+        except sf_project.RevisionConflict as error:
+            return self._send_json({"ok": False, "conflict": True, "error": str(error)}, HTTPStatus.CONFLICT)
+        except (ValueError, OSError) as error:
+            return self._send_json({"ok": False, "error": str(error)}, HTTPStatus.BAD_REQUEST)
+
+    def broll_starten(self, nur_status=False):
+        """Ein Knopf, zwei Zustaende (03.09.).
+
+        Sind noch keine Beats gebaut, geht der Auftrag an die Claude-Session
+        im CLAUDE-Tab. Sind sie da, meldet der Endpoint sie zurueck und das
+        Frontend haengt sie als Slots ein. Es entstehen NIE Slots auf Dateien,
+        die es noch nicht gibt — die sahen im Cockpit aus wie fertiges B-Roll
+        und liessen sich nicht abspielen (Sebastian, 03.09.).
+        """
+        if not self._term_origin_ok():
+            return self._send_json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
+        body = self._read_post_json()
+        if is_shortform():
+            if nur_status:
+                job = broll_contract.job_status(CFG["workdir"])
+                return self._send_json({"ok": True, "contract_version": 2, "job": job})
+            return self.production_broll_start(body)
+        provider = self.request_provider(body)
+        r = subprocess.run(
+            [sys.executable, os.path.join(HERE, "broll_auftrag.py"),
+             CFG["workdir"], "--json", *(["--status"] if nur_status else [])],
+            capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return self._send_json({"error": (r.stdout + r.stderr)[-500:]},
+                                   HTTPStatus.INTERNAL_SERVER_ERROR)
+        try:
+            doc = json.loads(r.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError) as e:
+            return self._send_json({"error": "Auftrag unlesbar: %r" % e},
+                                   HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        fertig, offen = [], []
+        for a in doc.get("auftraege", []):
+            a["abs"] = os.path.join(CFG["workdir"], a["out"])
+            if broll_file_ready(a["abs"]):
+                fertig.append(a)
+            else:
+                offen.append(a)
+
+        if doc.get("unmapped"):
+            return self._send_json({"ok": False, "error":
+                                    "Der Schnitt enthaelt neue oder veraenderte Takes ohne eindeutigen B-Roll-Auftrag. "
+                                    "Vorhandene Dateinummern werden nicht neu zugeordnet.",
+                                    "beats": fertig, "offen": len(offen), "unmapped": doc["unmapped"]},
+                                   HTTPStatus.CONFLICT)
+
+        if not offen:
+            print("[cockpit] B-Roll: %d Beats liegen vor, werden eingehaengt"
+                  % len(fertig), flush=True)
+            return self._send_json({"ok": True, "zustand": "fertig",
+                                    "beats": fertig, "offen": 0})
+
+        if nur_status:
+            # reines Nachsehen waehrend der Agent baut: nichts beauftragen
+            return self._send_json({"ok": True, "zustand": "laeuft",
+                                    "beats": fertig, "offen": len(offen)})
+
+        # Den Brief als Datei ablegen und dem Terminal nur einen KURZEN Befehl
+        # schicken. Ein langer Text wird von Claude Code als Paste gebuendelt
+        # ("[Pasted text #1]") und das angehaengte Return geht darin unter —
+        # der Auftrag stand dann im Eingabefeld, ohne je zu starten (03.09.).
+        brief = subprocess.run(
+            [sys.executable, os.path.join(HERE, "broll_brief.py"),
+             CFG["workdir"], "--offen-nur"], capture_output=True, text=True, timeout=60)
+        text = brief.stdout.strip() if brief.returncode == 0 else ""
+        if not text:
+            return self._send_json({"error": "Auftragsbrief leer"},
+                                   HTTPStatus.INTERNAL_SERVER_ERROR)
+        brief_p = os.path.join(CFG["workdir"], "broll_brief.txt")
+        with open(brief_p, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+
+        # DIREKT an den broll-ersteller (04.09.). Vorher lief der Auftrag ueber
+        # das Terminal der tmux-Session: dort sitzt eine Claude-Instanz, die den
+        # Auftrag erst liest und DANN den broll-ersteller beauftragt. Dieses
+        # Zwischenglied traegt nichts bei, hat den Auftrag als "[Pasted text]"
+        # verschluckt und laedt ausserdem alle MCP-Server (gemessen 268s statt
+        # 49s Startup, siehe reference_claude_p_headless).
+        # DIREKT an den broll-ersteller. Der Umweg ueber die Claude-Session
+        # im CLAUDE-Tab waere falsch: dort sitzt der video-cutter, nicht der
+        # B-Roll-Agent.
+        # Warum es am 04.09. zweimal "haengen blieb": nicht der Aufruf war
+        # schuld (isoliert getestet, antwortet sofort), sondern ein ALTER
+        # Server-Prozess, der weiterlief und noch --permission-mode acceptEdits
+        # mitgab — damit darf der Agent nur Dateien schreiben, aber kein Bash,
+        # und wartet ewig auf eine Freigabe. Deshalb hier KEIN permission-mode:
+        # der broll-ersteller bringt seinen eigenen mit (auto).
+        job = enqueue_broll(CFG["workdir"], os.path.dirname(HERE), provider, text)
+        freeze_broll_job(CFG["workdir"], job, doc)
+        gesendet = job.get("status") in ("queued", "running", "done")
+        print("[cockpit] B-Roll-Auftrag: %d offen, %d fertig, ans Terminal: %s"
+              % (len(offen), len(fertig), gesendet), flush=True)
+        return self._send_json({"ok": True, "zustand": "beauftragt",
+                                "offen": len(offen), "beats": fertig,
+                                "gesendet": gesendet, "brief": text, "provider": job["provider"], "job": job})
+
+    def broll_auftrag(self):
+        """B-Roll-Auftrag aus dem FINALEN Schnitt (03.09.).
+
+        Sebastians Ablauf: schneiden, von Hand nachkorrigieren, dann diesen
+        Knopf. Erst der Klick erklaert die Clips fuer final — ab da steht
+        fest, wie viele Clips es gibt und wie lang jeder ist. Ein B-Roll pro
+        Abschnitt. Das Produktionsprofil berücksichtigt auch Hook und CTA.
+        """
+        length = int(self.headers.get("Content-Length", "0"))
+        if length:
+            self.rfile.read(length)
+        r = subprocess.run(
+            [sys.executable, os.path.join(HERE, "broll_auftrag.py"),
+             CFG["workdir"], "--json"], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return self._send_json({"error": (r.stdout + r.stderr)[-500:]},
+                                   HTTPStatus.INTERNAL_SERVER_ERROR)
+        try:
+            doc = json.loads(r.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError) as e:
+            return self._send_json({"error": "broll_auftrag Ausgabe unlesbar: %r" % e},
+                                   HTTPStatus.INTERNAL_SERVER_ERROR)
+        for a in doc.get("auftraege", []):
+            a["abs"] = os.path.join(CFG["workdir"], a["out"])
+            a["fertig"] = broll_file_ready(a["abs"])
+        # Auftragsbrief fuer den broll-ersteller gleich mitliefern. Der Knopf
+        # legt ihn nur ins Prompt-Feld — 12 HyperFrames-Laeufe startet niemand
+        # ungefragt (Doktrin kein_ungefragtes_rendern).
+        brief = subprocess.run(
+            [sys.executable, os.path.join(HERE, "broll_brief.py"),
+             CFG["workdir"], "--offen-nur"], capture_output=True, text=True, timeout=60)
+        doc["brief"] = brief.stdout.strip() if brief.returncode == 0 else ""
+        print("[cockpit] B-Roll-Auftrag: %d Auftraege aus %d Clips"
+              % (doc.get("auftrag_count", 0), doc.get("clip_count", 0)), flush=True)
+        return self._send_json({"ok": True, "auftrag": doc})
+
+    def captions_sync(self):
+        # CapCut-Sync (01.09.): Captions deterministisch aus words_aai + dem
+        # AKTUELLEN Schnitt neu bauen (captions_from_words.py — Seiten an
+        # gemessenen Pausen, absolute Wort-Zeiten). Loest auch die Drift nach
+        # Schnitt-Aenderungen. Bestehende Datei wird vom Script gesichert.
+        length = int(self.headers.get("Content-Length", "0"))
+        if length:
+            self.rfile.read(length)
+        r = subprocess.run(
+            [sys.executable, os.path.join(HERE, "captions_from_words.py"),
+             CFG["workdir"]], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return self._send_json({"error": (r.stdout + r.stderr)[-500:]},
+                                   HTTPStatus.INTERNAL_SERVER_ERROR)
+        caps = load_json(os.path.join(CFG["workdir"], "captions_sf.json"), [])
+        print("[cockpit] Caption-Sync: %d Seiten" % len(caps), flush=True)
+        return self._send_json({"ok": True, "captions": caps,
+                                "log": r.stdout[-300:]})
+
+    def save_captions(self):
+        # SF-Modus (aus dem cockpit_sf-Fork): Text-Clips der Caption-Spur
+        # atomar nach captions_sf.json. rebuild_sf.py liest sie beim Render.
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"[]"
+        try:
+            incoming = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            return self._send_json({"error": "bad json: %s" % e}, HTTPStatus.BAD_REQUEST)
+        if not isinstance(incoming, list):
+            return self._send_json({"error": "captions muss eine Liste sein"}, HTTPStatus.BAD_REQUEST)
+        path = os.path.join(CFG["workdir"], "captions_sf.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(incoming, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+        return self._send_json({"ok": True, "n": len(incoming),
+                                "mtime": os.path.getmtime(path)})
+
     def save_overrides(self):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length) if length else b"{}"
@@ -1359,6 +1719,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"error": "bad json: %s" % e}, HTTPStatus.BAD_REQUEST)
         # Normalisieren + Defaults
         ovr = {
+            "audio": incoming.get("audio", (read_overrides().get("audio") or {})),
             "timeline_clips": incoming.get("timeline_clips", []) or [],
             "nudges": incoming.get("nudges", {}) or {},
             "gains": incoming.get("gains", {}) or {},
@@ -1393,7 +1754,8 @@ class Handler(BaseHTTPRequestHandler):
         seg_doc = load_json(CFG["segments_path"], {})
         segments = seg_doc.get("segments", []) if isinstance(seg_doc, dict) else []
         joint_times = compute_joint_times(segments, ovr)
-        self._send_json({"ok": True, "saved": CFG["overrides_path"], "jointTimes": joint_times})
+        self._send_json({"ok": True, "saved": CFG["overrides_path"], "jointTimes": joint_times,
+                         "mtime": os.path.getmtime(CFG["overrides_path"])})
 
     def rerender(self):
         """Echter Render-Hook: startet rerender.py als Background-Job.
@@ -1402,6 +1764,8 @@ class Handler(BaseHTTPRequestHandler):
         -> Nudges/Gains via first_id-Mapping -> Proxy-Render -> B-Roll-Pass.
         Status via GET /api/render_status.
         """
+        if is_shortform():
+            return self.start_sf_render("proxy", self._read_post_json())
         length = int(self.headers.get("Content-Length", "0"))
         if length:
             self.rfile.read(length)
@@ -1421,16 +1785,65 @@ class Handler(BaseHTTPRequestHandler):
             py = sys.executable
             log_path = os.path.join(CFG["workdir"], "rerender.log")
             logf = open(log_path, "w", encoding="utf-8")
-            proc = subprocess.Popen(
-                [py, os.path.join(HERE, "rerender.py"), CFG["workdir"], CFG["src_video"],
-                 CFG["words_path"], CFG["decisions_path"], CFG["proxy_path"],
-                 "--mode", "proxy", "--nudge-base", CFG["segments_path"]],
-                stdout=logf, stderr=subprocess.STDOUT)
+            # SF-WEICHE (01.09., aus dem cockpit_sf-Fork uebernommen): Liegt ein
+            # sf_layout.json im Workdir, ist das ein Shortform-Projekt — dann
+            # rendert rebuild_sf.py (Schnitt -> Karten -> Caption-Karaoke ->
+            # 1080x1920-Composite) statt der Longform-Kette.
+            if os.path.exists(os.path.join(CFG["workdir"], "sf_layout.json")):
+                cmd = [py, os.path.join(HERE, "rebuild_sf.py"),
+                       CFG["workdir"], CFG["src_video"]]
+            else:
+                cmd = [py, os.path.join(HERE, "rerender.py"), CFG["workdir"], CFG["src_video"],
+                       CFG["words_path"], CFG["decisions_path"], CFG["proxy_path"],
+                       "--mode", "proxy", "--nudge-base", CFG["segments_path"]]
+            proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
             CFG["job"] = {"proc": proc, "log": log_path, "logf": logf}
         sys.stderr.write("[cockpit] RERENDER gestartet (pid %d)\n" % proc.pid)
         self._send_json({"status": "started", "pid": proc.pid})
 
+    def export_final(self):
+        """Fertiges Video herausrendern (04.09.): 1080x1920, 60 fps, hohe Qualitaet.
+
+        Gleicher Renderweg wie die Vorschau, nur mit --export: langsameres
+        Preset, feineres CRF, faststart fuers Hochladen — und ein eigenes Ziel,
+        damit der Arbeits-Proxy bleibt, wo er ist.
+        """
+        if is_shortform():
+            return self.start_sf_render("export", self._read_post_json())
+        length = int(self.headers.get("Content-Length", "0"))
+        if length:
+            self.rfile.read(length)
+        if not os.path.exists(os.path.join(CFG["workdir"], "sf_layout.json")):
+            return self._send_json({"error": "Export gibt es nur fuer Shortform-Projekte"},
+                                   HTTPStatus.BAD_REQUEST)
+        if not CFG.get("src_video") or not os.path.exists(CFG["src_video"]):
+            return self._send_json({"error": "src_video fehlt"}, HTTPStatus.BAD_REQUEST)
+        name = os.path.basename(CFG["workdir"].rstrip("/")) or "export"
+        ziel = os.path.join(CFG["workdir"], "export", f"{name}_1080p60.mp4")
+        with JOB_LOCK:
+            job = CFG.get("job")
+            if job and job["proc"].poll() is None:
+                return self._send_json({"error": "Es laeuft schon ein Render"},
+                                       HTTPStatus.CONFLICT)
+            if job and job.get("logf"):
+                try:
+                    job["logf"].close()
+                except OSError:
+                    pass
+            log_path = os.path.join(CFG["workdir"], "export.log")
+            logf = open(log_path, "w", encoding="utf-8")
+            cmd = [sys.executable, os.path.join(HERE, "rebuild_sf.py"),
+                   CFG["workdir"], CFG["src_video"], "--export", "--out", ziel]
+            proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT)
+            CFG["job"] = {"proc": proc, "log": log_path, "logf": logf, "export": ziel}
+        print("[cockpit] EXPORT gestartet (pid %d) -> %s" % (proc.pid, ziel), flush=True)
+        return self._send_json({"status": "started", "pid": proc.pid, "ziel": ziel})
+
     def render_status(self):
+        if is_shortform():
+            import cutter_render_jobs
+            query = parse_qs(urlparse(self.path).query)
+            return self._send_json(cutter_render_jobs.read_status(CFG["workdir"], (query.get("job_id") or [None])[0]))
         with JOB_LOCK:
             job = CFG.get("job")
         if not job:
@@ -1450,8 +1863,14 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             job["logf"] = None
-        self._send_json({"status": "done" if code == 0 else "failed",
-                         "exit": code, "log": tail})
+        antwort = {"status": "done" if code == 0 else "failed",
+                   "exit": code, "log": tail}
+        if job.get("export"):
+            antwort["export"] = job["export"]
+            antwort["export_da"] = os.path.exists(job["export"])
+            if antwort["export_da"]:
+                antwort["export_mb"] = round(os.path.getsize(job["export"]) / 1048576.0, 1)
+        self._send_json(antwort)
 
 
 def main():
@@ -1471,6 +1890,10 @@ def main():
     qa_path = os.path.abspath(sys.argv[3])
     port = int(sys.argv[4]) if len(sys.argv) > 4 else 8766
     src_video = os.path.abspath(sys.argv[5]) if len(sys.argv) > 5 else None
+    # optionaler Anzeigename aus cockpit.json ("title"); ohne ihn bleibt es der Ordnername
+    _titel = (load_json(os.path.join(workdir, "cockpit.json"), {}) or {}).get("title")
+    if _titel:
+        CFG["title"] = _titel
 
     def first_existing(*cands):
         for c in cands:
@@ -1479,6 +1902,9 @@ def main():
         return cands[0]
 
     CFG["workdir"] = workdir
+    if os.path.exists(os.path.join(workdir, "sf_layout.json")):
+        sf_project.recover_settings(workdir)
+        sf_project.init_project(workdir)
     CFG["segments_path"] = segments_path
     CFG["qa_path"] = qa_path
     CFG["overrides_path"] = os.path.join(workdir, "cockpit_overrides.json")
@@ -1576,6 +2002,10 @@ def main():
         os._exit(0)
 
     signal.signal(signal.SIGTERM, _on_sigterm)
+
+    threading.Thread(target=_LIFECYCLE.run_forever, name="session-watchdog", daemon=True).start()
+    print("[cockpit] Session-Lifecycle aktiv: Projekt zu -> Claude-Session endet nach %ds ohne "
+          "Cockpit, Resume beim Oeffnen" % _LIFECYCLE.idle_seconds, flush=True)
 
     # allow_reuse_address: nach "PROJEKT WECHSELN" (Agentic OS killt den alten
     # Prozess per lsof) haengt der Port kurz im TIME_WAIT — ohne SO_REUSEADDR
