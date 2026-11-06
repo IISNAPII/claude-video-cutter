@@ -4,6 +4,7 @@ Key aus env AAI_KEY. Output:
   <out>/words_aai.json  : [{id,text,start,end,conf}]  (Sekunden)
   <out>/script_aai.txt  : lesbar, mit Pausen-Markern
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import os, sys, json, time, requests
 
 KEY = os.environ["AAI_KEY"]
@@ -47,10 +48,10 @@ def main():
     words = [{"id": f"w{i}", "text": w["text"], "start": round(w["start"]/1000, 3),
               "end": round(w["end"]/1000, 3), "conf": round(w.get("confidence", 0), 2)}
              for i, w in enumerate(ws)]
-    json.dump(words, open(os.path.join(outdir, "words_aai.json"), "w"), ensure_ascii=False, indent=0)
+    json.dump(words, open(os.path.join(outdir, "words_aai.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=0)
 
     # lesbares Skript: an Satzende / Pause>0.45s umbrechen, Pausen markieren
-    with open(os.path.join(outdir, "script_aai.txt"), "w") as f:
+    with open(os.path.join(outdir, "script_aai.txt"), "w", encoding="utf-8") as f:
         line, lstart = [], None
         for i, w in enumerate(words):
             if lstart is None: lstart = w["start"]

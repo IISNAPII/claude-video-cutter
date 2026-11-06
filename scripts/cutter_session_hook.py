@@ -33,7 +33,7 @@ import time
 def _write_atomic(path, doc):
     tmp = path + ".tmp"
     try:
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(doc, f, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception:
@@ -58,7 +58,7 @@ def main():
     if sid:
         ip = os.path.join(wd, "claude_session.json")
         try:
-            with open(ip) as f:
+            with open(ip, encoding="utf-8") as f:
                 prev = json.load(f) or {}
         except Exception:
             prev = {}
@@ -91,7 +91,7 @@ def main():
         doc["aufgabe"] = aufgabe
     else:
         try:                          # letzte Aufgabe behalten ("fertig: <was>")
-            doc["aufgabe"] = (json.load(open(sp)) or {}).get("aufgabe")
+            doc["aufgabe"] = (json.load(open(sp, encoding="utf-8")) or {}).get("aufgabe")
         except Exception:
             pass
     _write_atomic(sp, doc)

@@ -3,6 +3,7 @@
 
 The legacy CLI formatting below is only for old saved orders.
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import json, os, sys
 
 def build_brief(doc):

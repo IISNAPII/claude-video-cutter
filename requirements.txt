@@ -4,9 +4,10 @@ soundfile==0.14.0
 requests==2.34.2
 rapidfuzz==3.14.5
 faster-whisper==1.2.1
+av==18.1.0
 
 # Windows-Terminal (ConPTY) — nur auf Windows installiert
-pywinpty>=3.0.5; sys_platform == "win32"
+pywinpty==3.1.2; sys_platform == "win32"
 
 # Dependencies of the shared production cockpit
 Pillow==12.3.0

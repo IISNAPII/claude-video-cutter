@@ -22,6 +22,7 @@ Quelle mitgeschrieben, damit Konsumenten korrigieren koennen.
 Aufruf:
   .venv312/bin/python scripts/pause_map.py work/<name> [--wav pfad] [--src pfad]
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import argparse
 import json
 import os
@@ -75,7 +76,7 @@ def main():
     if not src:
         cj = os.path.join(w, "cockpit.json")
         if os.path.exists(cj):
-            src = (json.load(open(cj)) or {}).get("src_video")
+            src = (json.load(open(cj, encoding="utf-8")) or {}).get("src_video")
     aligned, audio_start = None, None
     if src and os.path.exists(src):
         audio_start = probe_audio_start(src)
@@ -118,7 +119,7 @@ def main():
     }
     out = os.path.join(w, "pause_map.json")
     tmp = out + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(doc, f)
     os.replace(tmp, out)
     print(f"[pause_map] {len(pauses)} Pausen -> {out} "

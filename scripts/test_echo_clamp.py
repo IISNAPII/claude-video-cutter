@@ -29,7 +29,7 @@ import rerender as rr  # noqa: E402
 
 
 def js_effective_jcuts(workdir):
-    html = open(os.path.join(V, "scripts", "cockpit", "index.html")).read()
+    html = open(os.path.join(V, "scripts", "cockpit", "index.html"), encoding="utf-8").read()
 
     def grab(name):
         m = re.search(r"(function %s\([^)]*\)\{.*?\n  \})" % name, html, re.S)
@@ -56,7 +56,7 @@ def js_effective_jcuts(workdir):
         """,
     ])
     tmp = "/tmp/echo_clamp_test.js"
-    open(tmp, "w").write(js)
+    open(tmp, "w", encoding="utf-8").write(js)
     res = subprocess.run(
         ["node", tmp, os.path.join(workdir, "pause_map.json"),
          os.path.join(workdir, "cockpit_overrides.json")],
@@ -68,7 +68,7 @@ def js_effective_jcuts(workdir):
 
 def main():
     workdir = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "work/yt1b")
-    ovr = json.load(open(os.path.join(workdir, "cockpit_overrides.json")))
+    ovr = json.load(open(os.path.join(workdir, "cockpit_overrides.json"), encoding="utf-8"))
     pauses = rr.load_pause_map(workdir)
     assert pauses, "pause_map.json fehlt — erst scripts/pause_map.py laufen lassen"
 

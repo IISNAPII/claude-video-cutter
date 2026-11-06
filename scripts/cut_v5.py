@@ -24,6 +24,7 @@ Messung V6: PTS-Raster 0,00 ms PASS, A/V-Dauer 0,3 ms, Naht-Sync Median -7,4 ms.
 
 Usage: cut_v5.py <src_video> <segments_v5.json> <out.mp4> [proxy|final]
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import sys, os, json, subprocess, tempfile, importlib.util
 
 BATCH = 25
@@ -46,7 +47,7 @@ def _render_via_split(src, segs_path, out_mp4, mode):
     rr = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rr)
 
-    segs = [dict(s) for s in json.load(open(segs_path))["segments"] if s["out"] > s["in"]]
+    segs = [dict(s) for s in json.load(open(segs_path, encoding="utf-8"))["segments"] if s["out"] > s["in"]]
     for s in segs:
         s.setdefault("gain_db", 0.0)
         s["jcut"] = 0.0
@@ -69,7 +70,7 @@ def main():
 
     print("[cutv5] WARNUNG: Legacy-concat-Pfad aktiv — erzeugt bei VFR-Quellen "
           "ein kaputtes PTS-Raster (verify_render FAIL).", flush=True)
-    S = json.load(open(segs_path))["segments"]
+    S = json.load(open(segs_path, encoding="utf-8"))["segments"]
     segs = [(s["in"], s["out"]) for s in S]
 
     if mode == "proxy":
@@ -103,7 +104,7 @@ def main():
         os.replace(batches[0], out_mp4)
     else:
         lst = os.path.join(tmp, "l.txt")
-        open(lst, "w").write("".join(f"file '{b}'\n" for b in batches))
+        open(lst, "w", encoding="utf-8").write("".join(f"file '{b}'\n" for b in batches))
         run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
              "-i", lst, "-c", "copy", out_mp4])
     print(f"[cutv5] FERTIG -> {out_mp4}", flush=True)

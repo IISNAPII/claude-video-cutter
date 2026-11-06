@@ -20,6 +20,7 @@ Regeln (aus teuren Fehlschlaegen destilliert, siehe Kommentare):
 
 Usage:  python scripts/build_playback_proxy.py work/<name> [--only main|broll]
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import argparse
 import json
 import os
@@ -93,7 +94,7 @@ def encode(src, dst, gop, extra_audio, max_side=None, hwaccel=None, crf=23):
     cmd = ["ffmpeg", "-hide_banner", "-y"] + input_args + ["-i", src,
            "-c:v", "libx264", "-g", str(gop), "-bf", "0",
            "-crf", str(crf), "-preset", "veryfast", "-tune", "fastdecode",
-           "-r", "30", "-vsync", "cfr"] + extra_audio + \
+           "-r", "30", "-fps_mode", "cfr"] + extra_audio + \
           ["-movflags", "+faststart", "-f", "mp4", part]
     if hwaccel == "videotoolbox":
         cmd[cmd.index("-c:v"):cmd.index("-c:v")] = ["-vf", videotoolbox_filters(src, max_side)]
@@ -142,7 +143,7 @@ def broll_sources(wd):
     p = os.path.join(wd, "broll_sync.json")
     if os.path.exists(p):
         try:
-            doc = json.load(open(p)) or {}
+            doc = json.load(open(p, encoding="utf-8")) or {}
         except Exception:
             doc = {}
     srcs = doc.get("sources") or ([doc] if doc.get("file") else [])
@@ -172,7 +173,7 @@ def main():
     ck = os.path.join(wd, "cockpit.json")
     if os.path.exists(ck):
         try:
-            src = (json.load(open(ck)) or {}).get("src_video")
+            src = (json.load(open(ck, encoding="utf-8")) or {}).get("src_video")
         except Exception:
             pass
     if not src or not os.path.exists(src):

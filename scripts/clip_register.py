@@ -20,6 +20,7 @@ Aufruf:
 --bind-cut-words: only immediately after transcribing this exact timeline.
 Persists source alignment so later cockpit edits do not require another ASR.
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import json, os, sys, datetime, hashlib
 
 def load(workdir, name, default=None):

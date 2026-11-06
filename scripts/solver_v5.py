@@ -15,6 +15,7 @@ Prinzip: Agent liefert cut_word_ids (WAS). Der Solver bestimmt WO:
 Usage: solver_v5.py <audio48k.wav> <words.json> <decisions.json> <outdir>
 Output: <outdir>/segments_v5.json (Segmente + Metriken + Flags)
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audio_measure import AudioMap
@@ -25,8 +26,8 @@ MIN_PAUSE_S = 0.15
 def main():
     audio_path, words_path, dec_path, outdir = sys.argv[1:5]
     os.makedirs(outdir, exist_ok=True)
-    words = json.load(open(words_path))
-    dec = json.load(open(dec_path))
+    words = json.load(open(words_path, encoding="utf-8"))
+    dec = json.load(open(dec_path, encoding="utf-8"))
     compress_s = dec.get("compress_pauses_over", 3.0)
     beat_s = dec.get("dead_air_beat", 0.5)
 
@@ -125,7 +126,7 @@ def main():
            "n_segments": len(merged), "n_cut_edges": max(0, 2 * len(merged) - 2),
            "params": {"lead": LEAD_S, "trail": TRAIL_S, "min_pause": MIN_PAUSE_S,
                       "compress_over": compress_s, "beat": beat_s}}
-    json.dump(out, open(os.path.join(outdir, "segments_v5.json"), "w"),
+    json.dump(out, open(os.path.join(outdir, "segments_v5.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     print(f"[solver] {len(merged)} Segmente, {keep:.0f}s/{total:.0f}s behalten, "
           f"{len(flags)} Graufall-Kanten -> segments_v5.json", flush=True)

@@ -25,6 +25,7 @@ rebuild_sf haben dafuer einen Fastpath (kein Rescale mehr).
 Usage: captions_from_words.py <workdir> [--dry]
 Bestehende captions_sf.json wird nach backups/ gesichert (User-Edits!).
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import json
 import os
 import shutil

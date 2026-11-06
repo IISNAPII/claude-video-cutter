@@ -27,6 +27,7 @@ Bei ueberlappenden Fenstern gewinnt die FRUEHERE Quelle in der Liste.
 Usage: broll_sync_pass.py <base_cut.mp4> <segments.json> <broll_sync.json>
                           <out.mp4> [--mode proxy|final]
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import sys, os, json, subprocess, tempfile
 
 import numpy as np
@@ -129,7 +130,7 @@ def main():
     if "--mode" in args:
         mode = args[args.index("--mode") + 1]
 
-    cfg = json.load(open(cfg_path))
+    cfg = json.load(open(cfg_path, encoding="utf-8"))
     pip = cfg.get("pip", {})
     # pip.enabled=false -> KEIN Facecam-Kreis, B-Roll laeuft vollflaechig
     # (v8d: Interview-Mitschnitt, waehrend der Grafik soll niemand zu sehen
@@ -143,10 +144,10 @@ def main():
     _ovr_early = {}
     if os.path.exists(ovr_path):
         try:
-            _ovr_early = json.load(open(ovr_path))
+            _ovr_early = json.load(open(ovr_path, encoding="utf-8"))
         except Exception:
             _ovr_early = {}
-    effective = json.load(open(segs_path))
+    effective = json.load(open(segs_path, encoding="utf-8"))
     cfg, _ovr_early, frame_audit = frame_timed_screen_slots(cfg, _ovr_early, effective)
     exact_screen_frames = cfg.get("exact_screen_frames") is True
     if exact_screen_frames:
@@ -623,7 +624,7 @@ def main():
         # J-Cut + VT erzeugte 133 ms konstanten A/V-Versatz (mod4v2, 15.08.).
         _jc = False
         try:
-            _segs = json.load(open(sys.argv[2])).get("segments", [])
+            _segs = json.load(open(sys.argv[2], encoding="utf-8")).get("segments", [])
             _jc = any(float(s.get("jcut", 0) or 0) > 1e-3 for s in _segs)
         except Exception:
             pass

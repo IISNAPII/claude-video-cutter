@@ -31,13 +31,13 @@ def number(value, label):
 
 def _profile(path):
     path = Path(path).expanduser().resolve()
-    doc = json.loads(path.read_text())
+    doc = json.loads(path.read_text(encoding="utf-8"))
     if not doc.get('version') or doc.get('profile_id') != 'skaile-shortform':
         raise ValueError('Versioned skaile-shortform profile required')
     approved_path = Path(doc['approved_sfx_file'])
     if not approved_path.is_absolute():
         approved_path = path.parent / approved_path
-    approved = json.loads(approved_path.read_text())
+    approved = json.loads(approved_path.read_text(encoding="utf-8"))
     assets = approved['assets']
     if not assets or len({a['id'] for a in assets}) != len(assets):
         raise ValueError('Approved SFX registry missing or ambiguous')

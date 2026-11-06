@@ -38,7 +38,10 @@ for t in <T1> <T2> <T3>; do ffmpeg -y -loglevel error -ss $((t-3)) -t 6 -i work/
 
 ## D2: Review-Liste
 Gegenleser-Feinschliff-Befunde (aus Phase B) nach `work/<name>/gegenleser.json`
-schreiben (Format: {"issues":[{type,from_id,to_id,beschreibung,vorschlag,confidence}]}), dann:
+schreiben (Format: {"issues":[{type,from_id,to_id,beschreibung,vorschlag,confidence}]}).
+`vorschlag` ist `"check"` oder `"review"` (beides: Mensch soll hinhören). Ab `confidence` 0.7
+erscheint der Befund im Feinschliff-Abschnitt, bei 0.4 bis 0.7 unter "Weniger sichere
+Gegenleser-Hinweise". Dann:
 ```bash
 .venv312/bin/python scripts/generate_review.py work/<name> \
   work/<name>/segments_v5_repaired.json work/<name>/verify2/qa_stage_a.json \
@@ -51,9 +54,11 @@ Atmer-Warnungen, Feinschliff-Kandidaten, komprimierte Stille >20s.
 
 **D3a — PFLICHT: `cockpit_setup.py` laufen lassen (ersetzt jede Handarbeit):**
 ```bash
-.venv312/bin/python scripts/cockpit_setup.py work/<name>
+.venv312/bin/python scripts/cockpit_setup.py work/<name> --src "<pfad-zum-quellvideo>" [--port <n>]
 ```
-(Windows: `.venv312/Scripts/python`.) Das Skript richtet das Workdir komplett
+(Windows: `.venv312/Scripts/python`.) `--src` ist beim ersten Lauf Pflicht, sonst endet das
+Skript mit FAIL "Quellvideo fehlt". `--port` setzt den Cockpit-Port in `cockpit.json`, ohne
+Angabe bleibt der vorhandene Wert (sonst 8766). Das Skript richtet das Workdir komplett
 ein, ist idempotent und rührt `cockpit_overrides.json` (= die Schnitte deines
 Users) NIE an: `broll_sync.json` (Quelle, Offset, `pip.transition.dur=0.45`,
 `render_size` 1920x1080, `mirror_sources=false` sobald Screen-Slots

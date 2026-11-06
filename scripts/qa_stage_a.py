@@ -15,6 +15,7 @@ Output: qa_stage_a.json (pro Naht: pass/fail + Gruende).
 
 Usage: qa_stage_a.py <audio48k.wav> <words.json> <decisions.json> <segments_v5.json> <outdir>
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import sys, os, json, tempfile
 import numpy as np
 import soundfile as sf
@@ -39,9 +40,9 @@ def main():
     audio_path, words_path, dec_path, segs_path, outdir = sys.argv[1:6]
     limit = int(sys.argv[6]) if len(sys.argv) > 6 else 0
     os.makedirs(outdir, exist_ok=True)
-    words = json.load(open(words_path))
-    dec = json.load(open(dec_path))
-    S = json.load(open(segs_path))["segments"]
+    words = json.load(open(words_path, encoding="utf-8"))
+    dec = json.load(open(dec_path, encoding="utf-8"))
+    S = json.load(open(segs_path, encoding="utf-8"))["segments"]
     cut_ids = set(dec.get("cut_word_ids", []))
 
     am = AudioMap(audio_path)
@@ -58,14 +59,14 @@ def main():
                                        condition_on_previous_text=False,
                                        no_repeat_ngram_size=3)
             heard = " ".join(s.text for s in segs).strip()
-            os.unlink(f.name)
+        os.unlink(f.name)
         return heard
 
     # Checkpoint-Resume: bei Kill geht kein Fortschritt mehr verloren (13.07.)
     partial_path = os.path.join(outdir, "qa_stage_a.partial.json")
     done = {}
     if os.path.exists(partial_path):
-        for r in json.load(open(partial_path)):
+        for r in json.load(open(partial_path, encoding="utf-8")):
             k = r["joint"]
             # nur uebernehmen wenn die Naht-Zeiten noch zu den Segmenten passen
             if k + 1 < len(S) and abs(S[k]["out"] - r["out"]) < 0.002 and abs(S[k + 1]["in"] - r["in"]) < 0.002:
@@ -127,10 +128,10 @@ def main():
                         "pass": not fails, "fails": fails})
         if (k + 1) % 10 == 0:
             print(f"[qaA] {k+1}/{len(S)-1} Naehte geprueft", flush=True)
-            json.dump(results, open(partial_path, "w"), ensure_ascii=False)
+            json.dump(results, open(partial_path, "w", encoding="utf-8"), ensure_ascii=False)
 
     n_fail = sum(1 for r in results if not r["pass"])
-    json.dump(results, open(os.path.join(outdir, "qa_stage_a.json"), "w"),
+    json.dump(results, open(os.path.join(outdir, "qa_stage_a.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     if not limit and os.path.exists(partial_path):
         os.remove(partial_path)

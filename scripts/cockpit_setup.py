@@ -7,7 +7,9 @@ jederzeit erneut laufen: bestehende Schnitte, Slot-Positionen und Grafiken
 werden NIE zurueckgesetzt.
 
 Usage:
-  cockpit_setup.py <workdir> [--src <video>] [--broll <datei> --offset <sek>] [--check-only]
+  cockpit_setup.py <workdir> [--src <video>] [--port <n>] [--broll <datei> --offset <sek>] [--check-only]
+  --src   Quellvideo. Beim ERSTEN Lauf eines Workdirs Pflicht (sonst FAIL "Quellvideo fehlt").
+  --port  Cockpit-Port für cockpit.json. Ohne Angabe bleibt der vorhandene Wert, sonst 8766.
 
 Pruefliste (alles wird gesetzt ODER als Befund gemeldet):
   1  broll_sync.json vorhanden, Quelle existiert, Offset gesetzt
@@ -21,6 +23,7 @@ Pruefliste (alles wird gesetzt ODER als Befund gemeldet):
   9  ffprobe/ffmpeg erreichbar
  10  keine Slot-Ueberlappungen in der Screen-Spur
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import json
 import os
 import shutil
@@ -44,7 +47,7 @@ def sag(status, text):
 
 def lade(p, default=None):
     try:
-        with open(p) as f:
+        with open(p, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -86,6 +89,7 @@ def main():
     broll_arg = args[args.index("--broll") + 1] if "--broll" in args else None
     offset_arg = float(args[args.index("--offset") + 1]) if "--offset" in args else None
     src_arg = args[args.index("--src") + 1] if "--src" in args else None
+    port_arg = int(args[args.index("--port") + 1]) if "--port" in args else None
     name = os.path.basename(wd)
     print(f"\n=== Cockpit-Einrichtung: {name} ===")
     if check_only:
@@ -207,14 +211,18 @@ def main():
     if not src or not os.path.exists(src):
         kand = [f for f in os.listdir(wd) if f.startswith(".protect_main")]
         src = os.path.join(wd, kand[0]) if kand else src
-    soll = {"src_video": src, "segments": seg, "qa": qa, "port": 8766}
+    soll = {"src_video": src, "segments": seg, "qa": qa,
+            "port": port_arg or ck.get("port") or 8766}
     if ck != soll:
         ck_neu = soll
         aenderungen.append("cockpit.json aktualisiert")
     else:
         ck_neu = ck
-    sag(OK if src and os.path.exists(src) else FAIL,
-        f"cockpit.json: src={os.path.basename(src or '?')} segments={seg} qa={qa}")
+    if src and os.path.exists(src):
+        sag(OK, f"cockpit.json: src={os.path.basename(src)} segments={seg} qa={qa}")
+    else:
+        sag(FAIL, "cockpit.json: Quellvideo fehlt. Beim ersten Lauf --src <video> angeben, "
+                  f"z.B. cockpit_setup.py work/{name} --src <pfad-zum-video>")
 
     # --- 11: Pausen-Karte (Echo-Clamp-Grundlage, 01.09.) --------------------
     # Ohne Karte klemmt weder Player noch Renderer die L-Cuts an die

@@ -4,6 +4,7 @@
 Historical schema 1 jobs retain their source-lineage mapping for existing media.
 New preview orders include hook/CTA and use actual speech duration.
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import json, os, re, subprocess, sys, datetime
 from pathlib import Path
 from cutter_provider import atomic_json, file_lock

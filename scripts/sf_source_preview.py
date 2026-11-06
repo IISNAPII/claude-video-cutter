@@ -38,7 +38,7 @@ def _cached(path, key):
     try:
         if path.stat().st_size > 16384:
             return None
-        result = json.loads(path.read_text())
+        result = json.loads(path.read_text(encoding="utf-8"))
         if result.get("key") == key and math.isfinite(float(result["base_gain_db"])):
             return result
     except (OSError, ValueError, KeyError, TypeError, AttributeError):

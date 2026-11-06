@@ -138,7 +138,7 @@ seg_bounds = [(c["cut_start"], c["cut_end"]) for c in plan]
 # --- 1) Bildschnitt: vom Audiopfad getrennt gecacht --------------------------
 seg_files = []
 concat_list = os.path.join(tmpdir, "concat.txt")
-with open(concat_list, "w") as lf:
+with open(concat_list, "w", encoding="utf-8") as lf:
     for i, item in enumerate(plan):
         RUNTIME.stage("segments", i, len(plan))
         c = item["clip"]
@@ -410,7 +410,7 @@ for gi, c in enumerate(sorted(caps, key=lambda x: float(x.get("start", 0)))):
 
 entries.sort(key=lambda e: e[1])
 cap_concat = os.path.join(capdir, "concat.txt")
-with open(cap_concat, "w") as f:
+with open(cap_concat, "w", encoding="utf-8") as f:
     cursor = 0.0
     lines = []
     for p, s0, s1 in entries:
@@ -429,7 +429,7 @@ if entries:
     cap_layer = CACHE.render("captions", {"captions": caps, "style": CAP_STYLE,
                                           "body": [body_t0, body_t1], "duration": dur_total},
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", cap_concat,
-         "-vsync", "vfr", "-c:v", "png", cap_layer])
+         "-fps_mode", "vfr", "-c:v", "png", cap_layer])
 print(f"[rebuild_sf] Captions: {len(entries)} Zustaende", flush=True)
 
 # --- 4) Statische Assets (Hook + Titel + Pill) -----------------------------

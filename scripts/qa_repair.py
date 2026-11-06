@@ -14,6 +14,7 @@ Regeln (konservativ, nie raten):
 
 Usage: qa_repair.py <audio48k> <words.json> <decisions.json> <segments.json> <qa.json> <out_segments.json>
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import sys, os, json
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,11 +50,11 @@ def micro_runs(am, t0, t1):
 
 def main():
     audio_path, words_path, dec_path, segs_path, qa_path, out_path = sys.argv[1:7]
-    words = json.load(open(words_path))
-    cut_ids = set(json.load(open(dec_path)).get("cut_word_ids", []))
-    doc = json.load(open(segs_path))
+    words = json.load(open(words_path, encoding="utf-8"))
+    cut_ids = set(json.load(open(dec_path, encoding="utf-8")).get("cut_word_ids", []))
+    doc = json.load(open(segs_path, encoding="utf-8"))
     S = doc["segments"]
-    QA = json.load(open(qa_path))
+    QA = json.load(open(qa_path, encoding="utf-8"))
 
     am = AudioMap(audio_path)
     repairs, warns, grau = [], [], []
@@ -100,7 +101,7 @@ def main():
 
     doc["segments"] = S
     doc["repair"] = {"repairs": repairs, "warns": warns, "graufaelle": grau}
-    json.dump(doc, open(out_path, "w"), ensure_ascii=False, indent=1)
+    json.dump(doc, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"[repair] {len(repairs)} Kanten repariert, {len(warns)} Warnungen (ok), "
           f"{len(grau)} Graufaelle -> {out_path}", flush=True)
     for rp in repairs:

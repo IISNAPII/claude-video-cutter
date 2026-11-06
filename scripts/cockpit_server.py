@@ -8,16 +8,15 @@ Serviert ein self-contained Frontend (scripts/cockpit/index.html), liest die
 Cut-Entscheidungen + QA-Report und schreibt Nach-Cut-Overrides atomar zurueck.
 Nur Python-Stdlib + numpy/soundfile.
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import base64
 from cutter_provider import TerminalManager, TerminalHandlerMixin, provider_name
 from cutter_broll_jobs import submit_marker
 from cutter_broll_jobs import enqueue as enqueue_broll
 from broll_auftrag import freeze_for_job as freeze_broll_job
-import fcntl
 from fractions import Fraction
 import json
 import os
-import pty
 import queue
 import re
 import shlex
@@ -26,7 +25,6 @@ import signal
 import struct
 import subprocess
 import sys
-import termios
 import threading
 import time
 import sf_project
@@ -289,7 +287,7 @@ def broll_sync_info():
     if _BROLL_SYNC["info"] is not None and _BROLL_SYNC["mtime"] == mtime:
         return _BROLL_SYNC["info"]
     try:
-        cfg = json.load(open(path))
+        cfg = json.load(open(path, encoding="utf-8"))
         raw = cfg.get("sources")
         if raw is None:
             raw = [{"name": None, "file": cfg.get("file"),
@@ -1744,7 +1742,7 @@ class Handler(TerminalHandlerMixin, BaseHTTPRequestHandler):
         if (base_mtime is not None and cur_mtime is not None
                 and abs(float(base_mtime) - cur_mtime) > 1.0):
             side = CFG["overrides_path"].replace(".json", ".CONFLICT-%d.json" % int(cur_mtime))
-            with open(side, "w") as f:
+            with open(side, "w", encoding="utf-8") as f:
                 json.dump(ovr, f, ensure_ascii=False, indent=1)
             print("[cockpit] KONFLIKT: veralteter Tab -> %s" % side, flush=True)
             return self._send_json({"ok": False, "conflict": True, "saved_to": side,

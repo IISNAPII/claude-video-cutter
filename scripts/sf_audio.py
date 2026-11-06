@@ -171,7 +171,7 @@ def _run(arguments):
 
 def _complete(directory, key):
     try:
-        doc = json.loads((directory / "complete.json").read_text())
+        doc = json.loads((directory / "complete.json").read_text(encoding="utf-8"))
         if doc.get("cache_key") == key and (directory / "audio.wav").is_file():
             return doc
     except (OSError, ValueError):

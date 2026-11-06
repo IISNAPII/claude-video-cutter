@@ -1,7 +1,10 @@
 """Shared Shortform settings, revisions and deterministic text artwork."""
 from contextlib import contextmanager
 from copy import deepcopy
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows
+    from posix_compat import fcntl
 import hashlib
 import json
 import os
@@ -55,7 +58,7 @@ def project_lock(workdir):
     with _LOCK:
         path = Path(workdir) / ".sf-settings.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as stream:
+        with path.open("a", encoding="utf-8") as stream:
             fcntl.flock(stream, fcntl.LOCK_EX)
             try:
                 yield

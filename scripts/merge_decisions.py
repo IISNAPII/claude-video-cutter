@@ -12,18 +12,19 @@ Regeln:
 Usage: merge_decisions.py <words.json> <global_cuts.json> <win_results.json> <outdir>
   win_results.json = Array von {"cuts":[...]} (ein Eintrag pro Fenster-Agent)
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import sys, json
 
 def main():
     words_path, global_path, wins_path, outdir = sys.argv[1:5]
-    words = json.load(open(words_path))
+    words = json.load(open(words_path, encoding="utf-8"))
     idx = {w["id"]: i for i, w in enumerate(words)}
     n = len(words)
 
     ranges = []
-    for s in json.load(open(global_path))["sections"]:
+    for s in json.load(open(global_path, encoding="utf-8"))["sections"]:
         ranges.append({**s, "src": "global"})
-    for winres in json.load(open(wins_path)):
+    for winres in json.load(open(wins_path, encoding="utf-8")):
         for c in winres.get("cuts", []):
             ranges.append({**c, "src": "window"})
 
@@ -49,7 +50,7 @@ def main():
 
     cut_ids = [words[i]["id"] for i in range(n) if cut[i] is not None]
     dec = {"cut_word_ids": cut_ids, "compress_pauses_over": 3.0}
-    json.dump(dec, open(f"{outdir}/decisions.json", "w"), ensure_ascii=False, indent=0)
+    json.dump(dec, open(f"{outdir}/decisions.json", "w", encoding="utf-8"), ensure_ascii=False, indent=0)
 
     # Report: zusammenhaengende Cut-Gruppen
     lines = ["# V6 Schnitt-Entscheidungen (auto-generiert)", ""]
@@ -67,7 +68,7 @@ def main():
         for rr in reasons: lines.append(f"- {rr}")
         lines.append("")
         groups += 1; i = j + 1
-    open(f"{outdir}/decisions_report.md", "w").write("\n".join(lines))
+    open(f"{outdir}/decisions_report.md", "w", encoding="utf-8").write("\n".join(lines))
 
     keep_words = n - len(cut_ids)
     cut_time = sum(words[idx[c]]["end"] - words[idx[c]]["start"] for c in cut_ids)
@@ -76,7 +77,7 @@ def main():
           f"{len(dropped)} Ranges verworfen.")
     for d in dropped[:10]:
         print(f"[merge]   verworfen ({d['why']}): {d.get('from_id')}-{d.get('to_id')} {d.get('reason','')[:60]}")
-    json.dump(dropped, open(f"{outdir}/dropped_ranges.json", "w"), ensure_ascii=False, indent=1)
+    json.dump(dropped, open(f"{outdir}/dropped_ranges.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 if __name__ == "__main__":
     main()

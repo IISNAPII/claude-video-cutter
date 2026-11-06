@@ -32,7 +32,7 @@ def headless_argv(provider, resolver=shutil.which, role_file=None):
     argv = [binary, "exec", "--ignore-user-config", "-p", "broll-ersteller", "--config",
             "developer_instructions=" + json.dumps(role.read_text(encoding="utf-8"))]
     config = Path.home() / ".codex/config.toml"
-    base = tomllib.loads(config.read_text()) if config.exists() else {}
+    base = tomllib.loads(config.read_text(encoding="utf-8")) if config.exists() else {}
     for key in ("model", "sandbox_mode", "approval_policy", "service_tier"):
         if isinstance(base.get(key), str):
             argv.extend(["--config", key + "=" + json.dumps(base[key])])

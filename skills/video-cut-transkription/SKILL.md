@@ -57,7 +57,7 @@ Dauer: Upload + ~5-10 Min. Bei >30 Min Laufzeit-Erwartung: als nohup-Job (Skill 
 ```bash
 .venv312/bin/python - <<'EOF'
 import json, collections
-w = json.load(open('work/<name>/words_aai.json'))
+w = json.load(open('work/<name>/words_aai.json', encoding='utf-8'))
 texts = [x['text'].lower() for x in w]
 grams = collections.Counter(tuple(texts[i:i+5]) for i in range(len(texts)-5))
 top = grams.most_common(3)
@@ -76,7 +76,7 @@ ein einzelnes seltsames Wort stützen.
 .venv312/bin/python - <<'EOF'
 import json
 NAME = '<name>'
-w = json.load(open(f'work/{NAME}/words_aai.json'))
+w = json.load(open(f'work/{NAME}/words_aai.json', encoding='utf-8'))
 lines, cur = [], []
 for i, x in enumerate(w):
     cur.append(x)
@@ -91,13 +91,13 @@ def fmt(ln):
     txt = " ".join(x['text'] for x in ln)
     if not ids: return f"          [{ln[0]['start']:7.1f}s] {txt}"
     return f"{ids[0]}-{ids[-1]} [{ln[0]['start']:7.1f}s] {txt}"
-open(f'work/{NAME}/script_ids.txt','w').write("\n".join(fmt(l) for l in lines))
+open(f'work/{NAME}/script_ids.txt','w',encoding='utf-8').write("\n".join(fmt(l) for l in lines))
 WIN, OV, t0, n = 600, 60, 0, 0
 t_end = w[-1]['end']
 while t0 < t_end:
     t1 = min(t0 + WIN + OV, t_end)
     sel = [l for l in lines if l[0]['start'] < t1 and l[-1]['end'] > t0]
-    open(f'work/{NAME}/win_{n:02d}.txt','w').write("\n".join(fmt(l) for l in sel))
+    open(f'work/{NAME}/win_{n:02d}.txt','w',encoding='utf-8').write("\n".join(fmt(l) for l in sel))
     n += 1; t0 += WIN
 sil = sum(l[0]['end']-l[0]['start'] for l in lines if l[0]['id']=='')
 print(f"{len(lines)} Zeilen, {n} Fenster, {sil/60:.1f} min Stille >3s")

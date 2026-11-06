@@ -3,12 +3,18 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows
+    from posix_compat import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
-import pty
+try:
+    import pty
+except ImportError:  # Windows
+    pty = None
 import queue
 import re
 import shutil
@@ -16,7 +22,14 @@ import signal
 import struct
 import subprocess
 import sys
-import termios
+try:
+    import termios
+except ImportError:  # Windows
+    termios = None
+try:
+    import winpty  # pywinpty (ConPTY), nur Windows
+except ImportError:
+    winpty = None
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -230,11 +243,22 @@ def terminal_launch(workdir, project_dir, provider, shortform=False, resolver=sh
     return Launch(args, cwd, env, provider)
 
 
+def kill_windows_tree(pid):
+    """Beendet pid samt Kindprozessen (Claude startet node und MCP-Server)."""
+    if not pid:
+        return
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 class TerminalSession:
     def __init__(self, provider):
         self.provider = provider
         self.lock = threading.RLock()
         self.fd = self.pid = None
+        self.proc = None  # winpty.PtyProcess (Windows/ConPTY), sonst None
         self.buf = b""
         self.subs = []
         self.alive = self.tmux = False
@@ -273,6 +297,12 @@ class TerminalSession:
 
     def write(self, data):
         with self.lock:
+            if self.proc is not None and self.alive:
+                try:
+                    self.proc.write(data.decode("utf-8", errors="replace"))
+                    return True
+                except (OSError, EOFError):
+                    return False
             if self.fd is None or not self.alive:
                 return False
             try:
@@ -284,7 +314,12 @@ class TerminalSession:
     def resize(self, cols=120, rows=32):
         cols, rows = max(20, min(500, int(cols))), max(5, min(200, int(rows)))
         with self.lock:
-            if self.fd is not None:
+            if self.proc is not None:
+                try:
+                    self.proc.setwinsize(rows, cols)
+                except (OSError, EOFError):
+                    pass
+            elif self.fd is not None and termios is not None:
                 try:
                     fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
                 except OSError:
@@ -292,8 +327,8 @@ class TerminalSession:
 
     def stop_attach(self):
         with self.lock:
-            pid = self.pid
-            self.pid = self.fd = None
+            pid, proc = self.pid, self.proc
+            self.pid = self.fd = self.proc = None
             self.alive = False
             self.generation += 1
             for subscriber in list(self.subs):
@@ -301,11 +336,54 @@ class TerminalSession:
                     subscriber.put_nowait(None)
                 except queue.Full:
                     pass
-        if pid:
+        if proc is not None:
+            kill_windows_tree(pid)
+            try:
+                proc.close(force=True)
+            except Exception:  # noqa: BLE001 (Aufräumen, Prozess ist ohnehin beendet)
+                pass
+        elif pid:
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+
+    def reader_conpty(self, proc, generation):
+        """Lese-Thread für Windows (ConPTY). proc.read() liefert str."""
+        try:
+            while True:
+                try:
+                    text = proc.read(65536)
+                except (EOFError, OSError):
+                    break
+                if not text:
+                    if not proc.isalive():
+                        break
+                    time.sleep(0.02)
+                    continue
+                with self.lock:
+                    if generation != self.generation:
+                        break
+                    self.append(text.encode("utf-8", errors="replace"))
+        finally:
+            try:
+                exit_code = proc.exitstatus
+            except Exception:  # noqa: BLE001
+                exit_code = None
+            try:
+                proc.close()
+            except Exception:  # noqa: BLE001
+                pass
+            with self.lock:
+                if generation == self.generation:
+                    self.alive = False
+                    self.fd = self.pid = self.proc = None
+                    self.exit_code = exit_code
+                    for subscriber in list(self.subs):
+                        try:
+                            subscriber.put_nowait(None)
+                        except queue.Full:
+                            pass
 
     def reader(self, fd, pid, generation):
         try:
@@ -402,14 +480,25 @@ class TerminalManager:
                         actual_profile = recorded if recorded in ("shortform-cutting", "video-cutter", "broll-ersteller") else None
                     use_tmux = True
             argv = [tmux, "attach-session", "-t", "=" + name] if use_tmux else command
-            pid, fd = pty.fork()
-            if pid == 0:
-                try:
-                    os.chdir(launch.cwd)
-                    os.execvpe(argv[0], argv, launch.env)
-                except Exception as error:
-                    os.write(2, ("\r\nTerminalstart fehlgeschlagen: " + str(error) + "\r\n").encode())
-                    os._exit(1)
+            proc = None
+            if pty is None:
+                if winpty is None:
+                    raise OSError("Eingebettetes Terminal braucht unter Windows pywinpty (pip install pywinpty)")
+                win_argv = list(argv)
+                if win_argv[0].lower().endswith((".cmd", ".bat")):  # npm-Shim (claude.CMD) braucht cmd
+                    win_argv = ["cmd.exe", "/c", *win_argv]
+                proc = winpty.PtyProcess.spawn(win_argv, cwd=launch.cwd, env=launch.env, dimensions=(rows, cols))
+                pid, fd = proc.pid, None
+                session.proc = proc
+            else:
+                pid, fd = pty.fork()
+                if pid == 0:
+                    try:
+                        os.chdir(launch.cwd)
+                        os.execvpe(argv[0], argv, launch.env)
+                    except Exception as error:
+                        os.write(2, ("\r\nTerminalstart fehlgeschlagen: " + str(error) + "\r\n").encode())
+                        os._exit(1)
             session.fd, session.pid = fd, pid
             session.profile = actual_profile
             atomic_json(self.store.workdir / ("cutter_terminal_role_" + provider + ".json"),
@@ -419,7 +508,10 @@ class TerminalManager:
             session.generation += 1
             generation = session.generation
             session.resize(cols, rows)
-            threading.Thread(target=session.reader, args=(fd, pid, generation), daemon=True).start()
+            if proc is not None:
+                threading.Thread(target=session.reader_conpty, args=(proc, generation), daemon=True).start()
+            else:
+                threading.Thread(target=session.reader, args=(fd, pid, generation), daemon=True).start()
             return session
 
     def reconnect(self, provider):
@@ -565,7 +657,7 @@ class TerminalHandlerMixin:
             return self._send_json({"error": "forbidden"}, 403)
         try:
             session = self.terminal_manager().start(self.request_provider())
-        except (RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as error:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")

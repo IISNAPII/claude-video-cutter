@@ -12,6 +12,7 @@ Kette:
 Usage: rerender.py <workdir> <src_video> <words_json> <decisions_json> <out_mp4>
                    [--mode proxy|final] [--nudge-base segments.json]
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import sys, os, json, subprocess, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +38,7 @@ def main():
     if "--nudge-base" in args: nudge_base = args[args.index("--nudge-base") + 1]
 
     ovr_path = os.path.join(workdir, "cockpit_overrides.json")
-    ovr = json.load(open(ovr_path)) if os.path.exists(ovr_path) else {}
+    ovr = json.load(open(ovr_path, encoding="utf-8")) if os.path.exists(ovr_path) else {}
     nudges = ovr.get("nudges", {}); gains = ovr.get("gains", {})
     broll = ovr.get("broll", []); extra = set(ovr.get("extra_cut_word_ids", []))
     uncut = set(ovr.get("uncut_word_ids", []))
@@ -75,17 +76,17 @@ def main():
         print(f"[rerender] TIMELINE-Modus: {len(segs)} Clips direkt aus dem Cockpit"
               + (f", {n_j}× L-Cut" if n_j else ""), flush=True)
         json.dump({"segments": segs, "keep_s": round(sum(s['out']-s['in'] for s in segs), 1)},
-                  open(os.path.join(workdir, "segments_effective.json"), "w"),
+                  open(os.path.join(workdir, "segments_effective.json"), "w", encoding="utf-8"),
                   ensure_ascii=False, indent=1)
         render_segments(segs, src, out_mp4, mode, broll, workdir)
         return
 
     # 1. effektive Entscheidungen
-    dec = json.load(open(dec_path))
+    dec = json.load(open(dec_path, encoding="utf-8"))
     cut_ids = (set(dec.get("cut_word_ids", [])) | extra) - uncut
     dec_eff = {**dec, "cut_word_ids": sorted(cut_ids, key=lambda s: int(s[1:]))}
     eff_path = os.path.join(workdir, "decisions_effective.json")
-    json.dump(dec_eff, open(eff_path, "w"), ensure_ascii=False, indent=0)
+    json.dump(dec_eff, open(eff_path, "w", encoding="utf-8"), ensure_ascii=False, indent=0)
     print(f"[rerender] {len(cut_ids)} Cut-Woerter effektiv "
           f"(+{len(extra)} extra, -{len(uncut)} restauriert)", flush=True)
 
@@ -93,7 +94,7 @@ def main():
     audio48 = os.path.join(workdir, "audio48k.wav")
     run([sys.executable, os.path.join(HERE, "solver_v5.py"),
          audio48, words_path, eff_path, workdir])
-    seg_doc = json.load(open(os.path.join(workdir, "segments_v5.json")))
+    seg_doc = json.load(open(os.path.join(workdir, "segments_v5.json"), encoding="utf-8"))
     segs = seg_doc["segments"]
 
     # 2b. Splits anwenden (Timeline-UI): Source-Zeit t im Segment → zwei Haelften.
@@ -134,7 +135,7 @@ def main():
     by_last = {s["last_id"]: s for s in segs}
     applied_n, applied_g = 0, 0
     if nudge_base and os.path.exists(nudge_base) and (nudges or gains):
-        base_segs = json.load(open(nudge_base))["segments"]
+        base_segs = json.load(open(nudge_base, encoding="utf-8"))["segments"]
         for key, delta in nudges.items():
             idx_s, edge = key.split(":")
             i = int(idx_s)
@@ -163,7 +164,7 @@ def main():
             s["out"] = max(s["in"] + 0.05, min(s["out"], nxt_in - 0.005))
     print(f"[rerender] {applied_n} Nudges, {applied_g} Gains angewendet", flush=True)
     seg_doc["segments"] = segs
-    json.dump(seg_doc, open(os.path.join(workdir, "segments_effective.json"), "w"),
+    json.dump(seg_doc, open(os.path.join(workdir, "segments_effective.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=1)
     render_segments(segs, src, out_mp4, mode, broll, workdir)
 
@@ -254,7 +255,7 @@ def load_pause_map(workdir):
     if not os.path.exists(p):
         return None
     try:
-        doc = json.load(open(p))
+        doc = json.load(open(p, encoding="utf-8"))
         off = 0.0
         if doc.get("aligned") is False and isinstance(doc.get("audio_start"), (int, float)):
             off = float(doc["audio_start"])
@@ -566,7 +567,7 @@ def render_base_split(segs, src, mode, vf_extra, venc, tmp):
         # jedes Bild exakt auf dem Raster — verifiziert per PTS-Scan ueber
         # alle 47128 Pakete (max. Abweichung 0.00 ms).
         lst = os.path.join(tmp, "lv.txt")
-        open(lst, "w").write("ffconcat version 1.0\n" + "".join(
+        open(lst, "w", encoding="utf-8").write("ffconcat version 1.0\n" + "".join(
             f"file '{b}'\nduration {n / FPS:.6f}\n" for b, n in vparts))
         run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
              "-i", lst, "-c", "copy", vid])
@@ -718,7 +719,7 @@ def render_segments(segs, src, out_mp4, mode, broll, workdir):
             bf = os.path.join(tmp, f"b{bi//BATCH:03d}.mp4")
             run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-filter_complex", fc,
                  "-map", "[v]", "-map", "[a]", *venc, "-c:a", "aac", "-b:a", abr,
-                 "-ar", "48000", "-r", f"{FPS:g}", "-vsync", "cfr", bf])
+                 "-ar", "48000", "-r", f"{FPS:g}", "-fps_mode", "cfr", bf])
             batches.append(bf)
             print(f"[rerender]   Batch {bi//BATCH+1}/{(len(pairs)+BATCH-1)//BATCH}", flush=True)
         base = os.path.join(tmp, "base.mp4")
@@ -726,7 +727,7 @@ def render_segments(segs, src, out_mp4, mode, broll, workdir):
             os.replace(batches[0], base)
         else:
             lst = os.path.join(tmp, "l.txt")
-            open(lst, "w").write("".join(f"file '{b}'\n" for b in batches))
+            open(lst, "w", encoding="utf-8").write("".join(f"file '{b}'\n" for b in batches))
             run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
                  "-i", lst, "-c", "copy", base])
 

@@ -8,6 +8,7 @@ Proxy-Timecodes zum Direkt-Anspringen. Quellen:
 
 Usage: generate_review.py <workdir> <segments_repaired.json> <verify_qa.json> <gegenleser.json> <out_md>
 """
+import utf8_console  # noqa: F401 (stdout/stderr auf UTF-8)
 import sys, os, json
 
 def fmt(t):
@@ -15,11 +16,11 @@ def fmt(t):
 
 def main():
     workdir, segs_path, qa_path, gg_path, out_md = sys.argv[1:6]
-    doc = json.load(open(segs_path))
+    doc = json.load(open(segs_path, encoding="utf-8"))
     S = doc["segments"]
-    QA = json.load(open(qa_path))
-    gg = json.load(open(gg_path)) if os.path.exists(gg_path) else {"issues": []}
-    words = json.load(open(os.path.join(workdir, "words_aai.json")))
+    QA = json.load(open(qa_path, encoding="utf-8"))
+    gg = json.load(open(gg_path, encoding="utf-8")) if os.path.exists(gg_path) else {"issues": []}
+    words = json.load(open(os.path.join(workdir, "words_aai.json"), encoding="utf-8"))
     widx = {w["id"]: w for w in words}
 
     # Proxy-Zeit: kumulierte Segmentlaengen; source->proxy Mapping
@@ -47,7 +48,7 @@ def main():
 
     # Content-Gaps aus workdir/content_gaps.json (pro Video, nicht hardcoden!)
     gaps_path = os.path.join(workdir, "content_gaps.json")
-    gaps = (json.load(open(gaps_path)).get("gaps", [])
+    gaps = (json.load(open(gaps_path, encoding="utf-8")).get("gaps", [])
             if os.path.exists(gaps_path) else [])
     if gaps:
         lines.append("## 🔴 WICHTIG: Content-Gaps im Rohmaterial")
@@ -77,9 +78,13 @@ def main():
         lines.append("- " + ", ".join(fmt(src_to_proxy(w["out"])) for w in warns))
         lines.append("")
 
-    # Gegenleser-Feinschliff (check-Items, nicht auto-appliziert)
-    checks = [i for i in gg.get("issues", []) if i.get("vorschlag") == "check"
-              and i.get("confidence", 0) >= 0.7]
+    # Gegenleser-Feinschliff (nicht auto-appliziert). "check" und "review" bedeuten
+    # beide: Mensch soll hinhören. Sichere Befunde (>= 0.7) stehen oben, unsichere
+    # (0.4 bis 0.7) darunter, damit nichts stillschweigend verschwindet.
+    HOERBAR = ("check", "review")
+    alle = [i for i in gg.get("issues", []) if i.get("vorschlag") in HOERBAR]
+    checks = [i for i in alle if i.get("confidence", 0) >= 0.7]
+    unsicher = [i for i in alle if 0.4 <= i.get("confidence", 0) < 0.7]
     lines.append(f"## Feinschliff-Kandidaten vom Gegenleser ({len(checks)} — im Cockpit nachcutten wenn stört)")
     for i in checks:
         w = widx.get(i["from_id"])
@@ -87,6 +92,14 @@ def main():
         pt = src_to_proxy(w["start"])
         lines.append(f"- **{fmt(pt)}** [{i['type']}] {i['beschreibung'][:110]}")
     lines.append("")
+    if unsicher:
+        lines.append(f"## Weniger sichere Gegenleser-Hinweise ({len(unsicher)} — Konfidenz 0.4 bis 0.7, nur bei Zeit anhören)")
+        for i in unsicher:
+            w = widx.get(i["from_id"])
+            if not w: continue
+            pt = src_to_proxy(w["start"])
+            lines.append(f"- **{fmt(pt)}** [{i['type']}, {i.get('confidence', 0):.2f}] {i['beschreibung'][:110]}")
+        lines.append("")
 
     # Komprimierte Dead-Air-Strecken >20s
     lines.append("## Komprimierte Stille-Strecken >20s (im Cockpit zurückholbar, falls Demo wichtig war)")
@@ -103,7 +116,7 @@ def main():
     lines.append(f"Gesamt: {len(S)} Segmente · {len(repairs)} Auto-Repairs · "
                  f"{len(fails_now)} Graufälle · {len(checks)} Feinschliff-Kandidaten")
 
-    open(out_md, "w").write("\n".join(lines) + "\n")
+    open(out_md, "w", encoding="utf-8").write("\n".join(lines) + "\n")
     print(f"[review] {out_md} geschrieben: {len(fails_now)} Graufälle, "
           f"{len(checks)} Feinschliff, {n_da} Dead-Air >20s")
 

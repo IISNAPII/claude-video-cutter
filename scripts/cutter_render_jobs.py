@@ -7,7 +7,10 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import contextmanager
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows
+    from posix_compat import fcntl
 import hashlib
 import json
 import os
@@ -48,7 +51,7 @@ def atomic_json(path, value):
 def file_lock(path, blocking=True):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+") as stream:
+    with path.open("a+", encoding="utf-8") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         try:
             yield stream
